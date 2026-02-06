@@ -276,7 +276,7 @@ rpl_semi_sync_master_enabled = ON
 rpl_semi_sync_slave_enabled = ON
 ```
 
-詳見 13-semi-sync-deep-dive.md
+詳見 12-semi-sync-and-error-1236.md
 
 ### semiSyncAckTimeout
 
@@ -314,7 +314,7 @@ rpl_semi_sync_master_timeout = 10000  # 毫秒
 | 效能 | 較慢 | 較快 |
 | Crash 安全 | 更安全 | 可能有 phantom read |
 
-詳見 13-semi-sync-deep-dive.md
+詳見 12-semi-sync-and-error-1236.md
 
 ### syncBinlog
 

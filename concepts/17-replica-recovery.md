@@ -443,7 +443,7 @@ Replica: 仍然記得舊的 gtid_slave_pos
 4. 使用備份中的 GTID 設定 `gtid_slave_pos`
 5. 重新 CHANGE MASTER TO
 
-**相關筆記**：12-error-1236-case-study.md
+**相關筆記**：12-semi-sync-and-error-1236.md
 
 ### Issue #1508: Replica recovery 不觸發
 
@@ -506,7 +506,7 @@ Error 1236 是最常觸發 Replica Recovery 的錯誤：
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-詳細分析請參照 12-error-1236-case-study.md
+詳細分析請參照 12-semi-sync-and-error-1236.md
 
 ## 關鍵程式碼路徑
 

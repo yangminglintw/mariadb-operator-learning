@@ -35,24 +35,6 @@ func (r *MariaDBReconciler) reconcileSuspend(ctx, mariadb) (ctrl.Result, error) 
 - Switchover 狀態（`ConditionTypePrimarySwitched=False`）仍然存在
 - Resume 後會繼續執行卡住的 switchover
 
-### cleanupPolicy: Skip/Delete
-
-**定義**：`api/v1alpha1/base_types.go:1020-1028`
-
-```yaml
-apiVersion: k8s.mariadb.com/v1alpha1
-kind: MariaDB
-spec:
-  cleanupPolicy: Delete  # 或 Skip
-```
-
-**用途**：
-- 用於 Grant/User/Database CR
-- `Delete`：刪除 CR 時也刪除 DB 中對應資源
-- `Skip`：刪除 CR 時保留 DB 中的資源
-
-**與 Replication 關係**：不直接相關，但影響 SQL 資源生命週期。
-
 ### syncTimeout
 
 **定義**：`api/v1alpha1/mariadb_replication_types.go:174-182`
@@ -124,21 +106,6 @@ spec:
 
 **注意**：MaxScale 使用自己的 `max_replication_lag` router 參數。
 
-### updateStrategy
-
-**定義**：`api/v1alpha1/mariadb_types.go:376-395`
-
-```yaml
-spec:
-  updateStrategy:
-    type: RollingUpdate  # 或 NeverUpdate, OnDelete
-    autoUpdateDataPlane: false
-```
-
-**與 Replication 關係**：
-- Rolling update 期間 Replication reconcile 仍會執行
-- 可能需要 suspend 來防止衝突
-
 ### 缺失的「旋鈕」
 
 以下功能目前**不支援**手動控制：
@@ -148,6 +115,8 @@ spec:
 | 手動取消 switchover | 無法取消 | 卡住的 switchover 需要手動修復 DB |
 | 連線重試次數/策略 | 無重試 | SQL 連線失敗直接報錯 |
 | Switchover 整體 timeout + 回退 | 無回退 | Phase 失敗後無限重試 |
+
+---
 
 ## DB 端 Debug（MariaDB SQL）
 
@@ -230,6 +199,18 @@ SELECT @@server_id;
 -- Pod-0 → server_id = 10
 -- Pod-1 → server_id = 11
 ```
+
+### 檢查 Binlog
+
+```sql
+-- Binlog 列表
+SHOW BINARY LOGS;
+
+-- Binlog 事件
+SHOW BINLOG EVENTS IN 'mysql-bin.000001' LIMIT 10;
+```
+
+---
 
 ## Operator 端 Debug（kubectl + logs）
 
@@ -320,6 +301,8 @@ args:
 # 這會 log 所有執行的 SQL 語句
 ```
 
+---
+
 ## Switchover 6 Phase 完整參照
 
 ```
@@ -376,6 +359,8 @@ Phase 6: Change primary to replica
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+---
+
 ## Debug 思路流程圖
 
 ```
@@ -401,6 +386,8 @@ Phase 6: Change primary to replica
   thread     或 recovery         或 手動修復
 ```
 
+---
+
 ## 常見問題診斷表
 
 | 症狀 | 可能原因 | 診斷方法 | 解決方案 |
@@ -411,6 +398,11 @@ Phase 6: Change primary to replica
 | Suspend 無法恢復 | Switchover 狀態仍在 | 檢查 `PrimarySwitched` condition | 手動清除 condition 或完成 switchover |
 | Replica 落後 | Relay log 未處理完 | `SHOW SLAVE STATUS` 看 lag | 等待或檢查 SQL thread |
 | Connection refused | Service/Pod 問題 | `kubectl get endpoints` | 檢查 Pod Ready 狀態 |
+| OOM Killed | Container 記憶體不足 | 檢查 exit code 137 | 增加 memory limit |
+| Disk full | 磁碟空間不足 | Error log 顯示 disk full | 清理 disk 或增加 PVC |
+| Too many connections | 連線數超限 | "Too many connections" error | 增加 max_connections |
+
+---
 
 ## Webhook vs Controller：問題定位
 
@@ -448,35 +440,177 @@ kubectl apply 失敗？
                           └── 等待或檢查 operator 是否運作
 ```
 
-### 範例
+---
 
-**Webhook 錯誤（#1488）**：
-```bash
-$ kubectl apply -f physicalbackup.yaml
-Error from server: error when creating "physicalbackup.yaml":
-admission webhook "vphysicalbackup.kb.io" denied the request:
-spec.schedule.cron is required
+## Corner Cases
+
+### 1. 所有 GTID 相同
+
+**情境**：
+```
+Pod-0: gtid_current_pos = 0-10-100
+Pod-1: gtid_current_pos = 0-10-100
+Pod-2: gtid_current_pos = 0-10-100
 ```
 
-**Controller 錯誤**：
-```bash
-$ kubectl get mariadb mariadb -o yaml
-status:
-  conditions:
-  - type: Ready
-    status: "False"
-    reason: "ReplicationError"
-    message: "error configuring replica: connection refused"
+**處理**：選擇 pod index 最小的作為新 primary。
+
+**為什麼會發生**：
+- Primary 沒有新的 write
+- 所有 replica 都已經 sync
+
+### 2. 沒有合格候選人
+
+**情境**：
+```
+Pod-0 (Primary): NotReady
+Pod-1: NotReady
+Pod-2: Slave_IO_Running = No
 ```
 
-### 關鍵差異
+**處理**：不執行 failover，等待人工介入。
 
-| 面向 | Webhook | Controller |
-|------|---------|------------|
-| 執行時機 | 寫入前（同步） | 寫入後（非同步） |
-| 錯誤回報 | kubectl 直接顯示 | status/events |
-| 可以修改資料？ | Mutating 可以 | 只能改 status |
-| 阻擋不合法資料？ | Yes | No（已存入 etcd）|
+### 3. Relay Log Pending
+
+**情境**：
+```
+Replica:
+  IO Thread: 已接收到 GTID 0-10-200
+  SQL Thread: 已執行到 GTID 0-10-150
+  Relay log: 50 個 pending transactions
+```
+
+**問題**：Failover 時使用 `gtid_current_pos` (0-10-150)，50 個 transaction 可能遺失。
+
+**處理**：
+- 等待 SQL thread 追上
+- 或接受可能的資料遺失
+
+### 4. Split Brain
+
+**情境**：
+```
+Network partition:
+  Zone A: Pod-0 (認為自己是 primary)
+  Zone B: Pod-1, Pod-2 (選出 Pod-1 為新 primary)
+
+結果: 兩個 primary 同時接受 writes
+```
+
+**預防措施**：
+1. 增加 `automaticFailoverDelay`
+2. 使用 semi-sync replication
+3. STONITH (Shoot The Other Node In The Head)
+
+---
+
+## Node NotReady Failover 處理
+
+### 處理流程
+
+```
+1. Node NotReady
+       │
+       ▼
+2. Pod 變成 Unknown/NotReady
+       │
+       ▼
+3. 等待 automaticFailoverDelay (預設 60s)
+       │
+       ▼
+4. Operator 執行 Failover
+       │
+       ├──► 選出新 Primary (最新 GTID)
+       │
+       ▼
+5. Node 恢復
+       │
+       ├──► 舊 Primary 變成 Replica
+       │
+       ▼
+6. 可能發生 Error 1236
+```
+
+### 快速診斷
+
+```bash
+# 1. 檢查 Node 狀態
+kubectl get nodes
+
+# 2. 檢查 Pod 狀態
+kubectl get pods -l app.kubernetes.io/instance=mariadb -o wide
+
+# 3. 檢查 Operator logs (找 failover 相關)
+kubectl logs deployment/mariadb-operator -n mariadb-operator | \
+  grep -i "failover\|primary" | tail -50
+
+# 4. 檢查 MariaDB CR 狀態
+kubectl get mariadb mariadb -o jsonpath='{.status}' | jq
+```
+
+### 恢復後的檢查清單
+
+```bash
+# 1. 確認所有 Pod 都 Ready
+kubectl get pods -l app.kubernetes.io/instance=mariadb
+
+# 2. 確認 Replication 正常
+for i in 1 2; do
+  echo "=== mariadb-$i ==="
+  kubectl exec mariadb-$i -- mysql -e "SHOW SLAVE STATUS\G" | \
+    grep -E "Slave_IO|Slave_SQL|Last_Error|Seconds_Behind"
+done
+
+# 3. 確認 GTID 正在同步
+kubectl exec mariadb-1 -- mysql -e "SELECT @@gtid_current_pos;"
+sleep 5
+kubectl exec mariadb-1 -- mysql -e "SELECT @@gtid_current_pos;"
+```
+
+---
+
+## 緊急處理 Runbook
+
+### Primary 掛了
+
+```bash
+# 1. 確認狀態
+kubectl get pods -l app.kubernetes.io/instance=mariadb
+kubectl get mariadb mariadb -o jsonpath='{.status.currentPrimaryPodIndex}'
+
+# 2. 如果 failover 沒有自動發生，檢查原因
+kubectl logs deployment/mariadb-operator -n mariadb-operator | tail -100
+
+# 3. 手動觸發 failover（修改 podIndex）
+kubectl patch mariadb mariadb --type=merge -p '{"spec":{"replication":{"primary":{"podIndex":1}}}}'
+```
+
+### Replication 斷了
+
+```bash
+# 1. 檢查 slave 狀態
+kubectl exec mariadb-1 -- mysql -e "SHOW SLAVE STATUS\G"
+
+# 2. 如果是 Error 1236，參考 12-semi-sync-and-error-1236.md
+
+# 3. 嘗試重新啟動 replication
+kubectl exec mariadb-1 -- mysql -e "STOP SLAVE; START SLAVE;"
+```
+
+### 需要完整重建
+
+```bash
+# 1. 刪除 pod 讓它重新建立
+kubectl delete pod mariadb-1
+
+# 2. 如果 PVC 資料損壞，可能需要刪除 PVC
+kubectl delete pvc data-mariadb-1
+
+# 3. 重新建立 pod
+# StatefulSet 會自動重建
+```
+
+---
 
 ## MariaDB Log 閱讀指南
 
@@ -512,36 +646,13 @@ Skipped GTID event
 Got fatal error 1236 from master when reading data from binary log
 ```
 
-### GTID Position 格式
-
-```
-GTID: 0-1-100
-      │ │ └── sequence number (單調遞增)
-      │ └──── server_id
-      └────── domain_id
-
-範例：
-- 0-10-1000: domain 0, server_id 10, sequence 1000
-- 0-11-500:  domain 0, server_id 11, sequence 500
-```
-
-### 取得 MariaDB Log
-
-```bash
-# 直接從 Pod 取得
-kubectl logs mariadb-0 -c mariadb
-
-# 從 PVC 取得（如果 Pod 不存在）
-kubectl run debug --image=busybox --rm -it --restart=Never -- \
-  cat /var/lib/mysql/mariadb.err
-```
+---
 
 ## 關鍵程式碼路徑
 
 | 功能 | 檔案 |
 |------|------|
 | SuspendTemplate | `api/v1alpha1/base_types.go:997-1004` |
-| CleanupPolicy | `api/v1alpha1/base_types.go:1020-1028` |
 | Replication spec | `api/v1alpha1/mariadb_replication_types.go` |
 | reconcileSuspend() | `internal/controller/mariadb_controller.go:964-975` |
 | Switchover 6 Phase | `pkg/controller/replication/switchover.go` |
