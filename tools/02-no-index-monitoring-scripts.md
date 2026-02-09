@@ -30,12 +30,16 @@ for i in $(seq 0 $((REPLICAS - 1))); do
   PODS="${PODS} ${STS_NAME}-${i}"
 done
 
-# 一次取得所有角色（從 operator CR status，最可靠）
-ROLES_JSON=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
-  get mariadb "${STS_NAME}" -o jsonpath='{.status.replication.roles}')
+# 從 CR status 取得 Primary pod 名稱
+CURRENT_PRIMARY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  get mariadb "${STS_NAME}" -o jsonpath='{.status.currentPrimary}')
 
 get_role() {
-  echo "$ROLES_JSON" | jq -r --arg pod "$1" '.[$pod] // "Unknown"'
+  if [ "$1" = "$CURRENT_PRIMARY" ]; then
+    echo "Primary"
+  else
+    echo "Replica"
+  fi
 }
 
 echo "Digest: ${DIGEST}"
@@ -214,16 +218,12 @@ if [ -z "$REPLICAS" ] || [ "$REPLICAS" -eq 0 ]; then
   exit 1
 fi
 
-# 從 operator CR status 取得角色（最可靠）
-ROLES_JSON=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
-  get mariadb "${STS_NAME}" -o jsonpath='{.status.replication.roles}')
-
-# 找出 Primary pod
-PRIMARY_POD=$(echo "$ROLES_JSON" | jq -r 'to_entries[] | select(.value == "Primary") | .key')
+# 從 CR status 取得 Primary pod 名稱
+PRIMARY_POD=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  get mariadb "${STS_NAME}" -o jsonpath='{.status.currentPrimary}')
 
 if [ -z "$PRIMARY_POD" ]; then
-  echo "Error: No Primary pod found in CR status"
-  echo "Roles: $(echo "$ROLES_JSON" | jq -c '.')"
+  echo "Error: No Primary pod found in CR status (.status.currentPrimary)"
   exit 1
 fi
 
