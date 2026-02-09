@@ -18,9 +18,25 @@ if [ -z "$DIGEST" ]; then
   exit 1
 fi
 
-PODS=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" get pods \
-  -l app.kubernetes.io/instance="${STS_NAME}" \
-  -o jsonpath='{.items[*].metadata.name}')
+# Pod 名稱從 StatefulSet replicas 數生成（避免 label 誤匹配 MaxScale 等非 DB pod）
+REPLICAS=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" get sts "${STS_NAME}" \
+  -o jsonpath='{.spec.replicas}')
+if [ -z "$REPLICAS" ] || [ "$REPLICAS" -eq 0 ]; then
+  echo "Error: StatefulSet ${STS_NAME} not found or has 0 replicas"
+  exit 1
+fi
+PODS=""
+for i in $(seq 0 $((REPLICAS - 1))); do
+  PODS="${PODS} ${STS_NAME}-${i}"
+done
+
+# 一次取得所有角色（從 operator CR status，最可靠）
+ROLES_JSON=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  get mariadb "${STS_NAME}" -o jsonpath='{.status.replication.roles}')
+
+get_role() {
+  echo "$ROLES_JSON" | jq -r --arg pod "$1" '.[$pod] // "Unknown"'
+}
 
 echo "Digest: ${DIGEST}"
 echo ""
@@ -32,8 +48,7 @@ for POD in $PODS; do
     echo "----------------------------------------"
     echo "Pod: ${POD}"
 
-    ROLE=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-      mysql -N -e "SELECT IF(@@read_only = 0, 'PRIMARY', 'REPLICA')" 2>/dev/null)
+    ROLE=$(get_role "$POD")
     echo "Role: ${ROLE}"
 
     RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
@@ -68,8 +83,7 @@ for POD in $PODS; do
       " 2>/dev/null)
 
     if [ -n "$RESULT" ]; then
-      ROLE=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-        mysql -N -e "SELECT IF(@@read_only = 0, 'P', 'R')" 2>/dev/null)
+      ROLE=$(get_role "$POD")
       echo "[${POD}] (${ROLE}) ${RESULT}"
       FOUND=1
     fi
@@ -79,18 +93,26 @@ done
 if [ "$FOUND" -eq 0 ] || [ "$VERBOSE" = "--verbose" ]; then
   echo ""
   echo "=== Digest Pattern (from summary) ==="
-  FIRST_POD=$(echo $PODS | awk '{print $1}')
-  kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${FIRST_POD}" -c mariadb -- \
-    mysql -N -e "
-      SELECT CONCAT(
-        'Schema: ', IFNULL(SCHEMA_NAME, 'N/A'), '\n',
-        'Pattern: ', DIGEST_TEXT, '\n',
-        'No_index_count: ', SUM_NO_INDEX_USED, '\n',
-        'Total_exec: ', COUNT_STAR
-      )
-      FROM performance_schema.events_statements_summary_by_digest
-      WHERE DIGEST = '${DIGEST}'
-    " 2>/dev/null
+  for POD in $PODS; do
+    ROLE=$(get_role "$POD")
+    SUMMARY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+      mysql -N -e "
+        SELECT CONCAT(
+          'Schema: ', IFNULL(SCHEMA_NAME, 'N/A'), '\n',
+          'Pattern: ', DIGEST_TEXT, '\n',
+          'No_index_count: ', SUM_NO_INDEX_USED, '\n',
+          'Total_exec: ', COUNT_STAR
+        )
+        FROM performance_schema.events_statements_summary_by_digest
+        WHERE DIGEST = '${DIGEST}'
+      " 2>/dev/null)
+
+    if [ -n "$SUMMARY" ]; then
+      echo "[${POD}] (${ROLE})"
+      echo "$SUMMARY"
+      echo ""
+    fi
+  done
 fi
 ```
 
@@ -100,14 +122,21 @@ fi
 ```
 Digest: abc123def456...
 
-[mariadb-0] (P) SELECT * FROM users WHERE email = 'test@example.com'
-[mariadb-2] (R) SELECT * FROM users WHERE email = 'foo@bar.com'
+[mariadb-0] (Primary) SELECT * FROM users WHERE email = 'test@example.com'
+[mariadb-2] (Replica) SELECT * FROM users WHERE email = 'foo@bar.com'
 
 === Digest Pattern (from summary) ===
+[mariadb-0] (Primary)
 Schema: myapp
 Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 1000
+No_index_count: 5000
 Total_exec: 5000
+
+[mariadb-1] (Replica)
+Schema: myapp
+Pattern: SELECT * FROM users WHERE email = ?
+No_index_count: 50000
+Total_exec: 50000
 ```
 
 **完整版（--verbose）**：
@@ -116,7 +145,7 @@ Digest: abc123def456...
 
 ----------------------------------------
 Pod: mariadb-0
-Role: PRIMARY
+Role: Primary
 [Found]
 Schema: myapp
 SQL: SELECT * FROM users WHERE email = 'test@example.com'
@@ -125,17 +154,36 @@ Rows_sent: 1
 
 ----------------------------------------
 Pod: mariadb-1
-Role: REPLICA
+Role: Replica
 [Not found in history]
 
 ----------------------------------------
 Pod: mariadb-2
-Role: REPLICA
+Role: Replica
 [Found]
 Schema: myapp
 SQL: SELECT * FROM users WHERE email = 'foo@bar.com'
 Rows_examined: 50000
 Rows_sent: 1
+
+=== Digest Pattern (from summary) ===
+[mariadb-0] (Primary)
+Schema: myapp
+Pattern: SELECT * FROM users WHERE email = ?
+No_index_count: 5000
+Total_exec: 5000
+
+[mariadb-1] (Replica)
+Schema: myapp
+Pattern: SELECT * FROM users WHERE email = ?
+No_index_count: 50000
+Total_exec: 50000
+
+[mariadb-2] (Replica)
+Schema: myapp
+Pattern: SELECT * FROM users WHERE email = ?
+No_index_count: 50000
+Total_exec: 50000
 ```
 
 ---
@@ -158,31 +206,24 @@ if [ -z "$SQL" ]; then
   exit 1
 fi
 
-# 找出所有 pods
-PODS=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" get pods \
-  -l app.kubernetes.io/instance="${STS_NAME}" \
-  -o jsonpath='{.items[*].metadata.name}')
-
-if [ -z "$PODS" ]; then
-  echo "Error: No pods found for StatefulSet ${STS_NAME}"
+# Pod 名稱從 StatefulSet replicas 數生成（避免 label 誤匹配 MaxScale 等非 DB pod）
+REPLICAS=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" get sts "${STS_NAME}" \
+  -o jsonpath='{.spec.replicas}')
+if [ -z "$REPLICAS" ] || [ "$REPLICAS" -eq 0 ]; then
+  echo "Error: StatefulSet ${STS_NAME} not found or has 0 replicas"
   exit 1
 fi
 
-# 找出 Primary pod（@@read_only = 0）
-PRIMARY_POD=""
-for POD in $PODS; do
-  READ_ONLY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-    mysql -N -e "SELECT @@read_only" 2>/dev/null)
+# 從 operator CR status 取得角色（最可靠）
+ROLES_JSON=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  get mariadb "${STS_NAME}" -o jsonpath='{.status.replication.roles}')
 
-  if [ "$READ_ONLY" = "0" ]; then
-    PRIMARY_POD="$POD"
-    break
-  fi
-done
+# 找出 Primary pod
+PRIMARY_POD=$(echo "$ROLES_JSON" | jq -r 'to_entries[] | select(.value == "Primary") | .key')
 
 if [ -z "$PRIMARY_POD" ]; then
-  echo "Error: No Primary pod found (all pods are read_only)"
-  echo "Available pods: $PODS"
+  echo "Error: No Primary pod found in CR status"
+  echo "Roles: $(echo "$ROLES_JSON" | jq -c '.')"
   exit 1
 fi
 
