@@ -30,6 +30,10 @@ for i in $(seq 0 $((REPLICAS - 1))); do
   PODS="${PODS} ${STS_NAME}-${i}"
 done
 
+# 從容器環境變數取得 root 密碼
+MYSQL_PWD=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  exec "${STS_NAME}-0" -c mariadb -- printenv MARIADB_ROOT_PASSWORD)
+
 # 從 CR status 取得 Primary pod 名稱
 CURRENT_PRIMARY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
   get mariadb "${STS_NAME}" -o jsonpath='{.status.currentPrimary}')
@@ -56,18 +60,16 @@ for POD in $PODS; do
     echo "Role: ${ROLE}"
 
     RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-      mysql -N -e "
-        SELECT CONCAT(
-          'Schema: ', IFNULL(CURRENT_SCHEMA, 'N/A'), '\n',
-          'SQL: ', SQL_TEXT, '\n',
-          'Rows_examined: ', ROWS_EXAMINED, '\n',
-          'Rows_sent: ', ROWS_SENT
-        )
+      mariadb -u root -p"${MYSQL_PWD}" -e "
+        SELECT IFNULL(CURRENT_SCHEMA, 'N/A') AS schema_name,
+               SQL_TEXT AS sql_text,
+               ROWS_EXAMINED AS rows_examined,
+               ROWS_SENT AS rows_sent
         FROM performance_schema.events_statements_history
         WHERE DIGEST = '${DIGEST}'
         ORDER BY EVENT_ID DESC
         LIMIT 2
-      " 2>/dev/null)
+      ")
 
     if [ -n "$RESULT" ]; then
       echo "[Found]"
@@ -79,12 +81,12 @@ for POD in $PODS; do
     echo ""
   else
     RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-      mysql -N -e "
+      mariadb -u root -p"${MYSQL_PWD}" -N -e "
         SELECT SQL_TEXT
         FROM performance_schema.events_statements_history
         WHERE DIGEST = '${DIGEST}'
         LIMIT 1
-      " 2>/dev/null)
+      ")
 
     if [ -n "$RESULT" ]; then
       ROLE=$(get_role "$POD")
@@ -100,23 +102,27 @@ if [ "$FOUND" -eq 0 ] || [ "$VERBOSE" = "--verbose" ]; then
   for POD in $PODS; do
     ROLE=$(get_role "$POD")
     SUMMARY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
-      mysql -N -e "
-        SELECT CONCAT(
-          'Schema: ', IFNULL(SCHEMA_NAME, 'N/A'), '\n',
-          'Pattern: ', DIGEST_TEXT, '\n',
-          'No_index_count: ', SUM_NO_INDEX_USED, '\n',
-          'Total_exec: ', COUNT_STAR
-        )
+      mariadb -u root -p"${MYSQL_PWD}" -e "
+        SELECT IFNULL(SCHEMA_NAME, 'N/A') AS schema_name,
+               DIGEST_TEXT AS pattern,
+               SUM_NO_INDEX_USED AS no_index_count,
+               COUNT_STAR AS total_exec
         FROM performance_schema.events_statements_summary_by_digest
         WHERE DIGEST = '${DIGEST}'
-      " 2>/dev/null)
+      ")
 
     if [ -n "$SUMMARY" ]; then
       echo "[${POD}] (${ROLE})"
       echo "$SUMMARY"
       echo ""
+      FOUND=1
     fi
   done
+
+  if [ "$FOUND" -eq 0 ]; then
+    echo "Digest ${DIGEST} not found on any pod."
+    echo "Debug: 確認 digest 值正確，或該 SQL 已從 performance_schema 中被淘汰"
+  fi
 fi
 ```
 
@@ -131,16 +137,18 @@ Digest: abc123def456...
 
 === Digest Pattern (from summary) ===
 [mariadb-0] (Primary)
-Schema: myapp
-Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 5000
-Total_exec: 5000
++-------------+------------------------------------------+----------------+------------+
+| schema_name | pattern                                  | no_index_count | total_exec |
++-------------+------------------------------------------+----------------+------------+
+| myapp       | SELECT * FROM users WHERE email = ?      |           5000 |       5000 |
++-------------+------------------------------------------+----------------+------------+
 
 [mariadb-1] (Replica)
-Schema: myapp
-Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 50000
-Total_exec: 50000
++-------------+------------------------------------------+----------------+------------+
+| schema_name | pattern                                  | no_index_count | total_exec |
++-------------+------------------------------------------+----------------+------------+
+| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
++-------------+------------------------------------------+----------------+------------+
 ```
 
 **完整版（--verbose）**：
@@ -151,10 +159,11 @@ Digest: abc123def456...
 Pod: mariadb-0
 Role: Primary
 [Found]
-Schema: myapp
-SQL: SELECT * FROM users WHERE email = 'test@example.com'
-Rows_examined: 50000
-Rows_sent: 1
++-------------+----------------------------------------------------+---------------+-----------+
+| schema_name | sql_text                                           | rows_examined | rows_sent |
++-------------+----------------------------------------------------+---------------+-----------+
+| myapp       | SELECT * FROM users WHERE email = 'test@test.com'  |         50000 |         1 |
++-------------+----------------------------------------------------+---------------+-----------+
 
 ----------------------------------------
 Pod: mariadb-1
@@ -165,29 +174,33 @@ Role: Replica
 Pod: mariadb-2
 Role: Replica
 [Found]
-Schema: myapp
-SQL: SELECT * FROM users WHERE email = 'foo@bar.com'
-Rows_examined: 50000
-Rows_sent: 1
++-------------+----------------------------------------------------+---------------+-----------+
+| schema_name | sql_text                                           | rows_examined | rows_sent |
++-------------+----------------------------------------------------+---------------+-----------+
+| myapp       | SELECT * FROM users WHERE email = 'foo@bar.com'    |         50000 |         1 |
++-------------+----------------------------------------------------+---------------+-----------+
 
 === Digest Pattern (from summary) ===
 [mariadb-0] (Primary)
-Schema: myapp
-Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 5000
-Total_exec: 5000
++-------------+------------------------------------------+----------------+------------+
+| schema_name | pattern                                  | no_index_count | total_exec |
++-------------+------------------------------------------+----------------+------------+
+| myapp       | SELECT * FROM users WHERE email = ?      |           5000 |       5000 |
++-------------+------------------------------------------+----------------+------------+
 
 [mariadb-1] (Replica)
-Schema: myapp
-Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 50000
-Total_exec: 50000
++-------------+------------------------------------------+----------------+------------+
+| schema_name | pattern                                  | no_index_count | total_exec |
++-------------+------------------------------------------+----------------+------------+
+| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
++-------------+------------------------------------------+----------------+------------+
 
 [mariadb-2] (Replica)
-Schema: myapp
-Pattern: SELECT * FROM users WHERE email = ?
-No_index_count: 50000
-Total_exec: 50000
++-------------+------------------------------------------+----------------+------------+
+| schema_name | pattern                                  | no_index_count | total_exec |
++-------------+------------------------------------------+----------------+------------+
+| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
++-------------+------------------------------------------+----------------+------------+
 ```
 
 ---
@@ -218,6 +231,10 @@ if [ -z "$REPLICAS" ] || [ "$REPLICAS" -eq 0 ]; then
   exit 1
 fi
 
+# 從容器環境變數取得 root 密碼
+MYSQL_PWD=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
+  exec "${STS_NAME}-0" -c mariadb -- printenv MARIADB_ROOT_PASSWORD)
+
 # 從 CR status 取得 Primary pod 名稱
 PRIMARY_POD=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" \
   get mariadb "${STS_NAME}" -o jsonpath='{.status.currentPrimary}')
@@ -238,12 +255,12 @@ echo ""
 
 echo "=== EXPLAIN ==="
 kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
-  mysql -e "EXPLAIN ${SQL}" 2>/dev/null
+  mariadb -u root -p"${MYSQL_PWD}" -e "EXPLAIN ${SQL}"
 
 echo ""
 echo "=== 解讀 ==="
 kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
-  mysql -e "
+  mariadb -u root -p"${MYSQL_PWD}" -e "
     SELECT
       CASE
         WHEN type = 'ALL' THEN '!! Full Table Scan'
@@ -255,7 +272,7 @@ kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariad
       IFNULL(key, 'none') AS actual_index,
       rows AS estimated_rows
     FROM (EXPLAIN ${SQL}) AS e
-  " 2>/dev/null
+  "
 
 echo ""
 echo "=== 檢查清單 ==="
