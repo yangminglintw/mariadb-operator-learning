@@ -145,29 +145,63 @@ Rows_sent: 1
 ```bash
 #!/bin/bash
 # analyze_sql.sh
-# 用法：./analyze_sql.sh <context> <namespace> <pod> "<SQL>"
+# 用法：./analyze_sql.sh <context> <namespace> <statefulset> "<SQL>"
+# 自動找到 Primary pod 執行 EXPLAIN
 
 CONTEXT="$1"
 NAMESPACE="$2"
-POD="$3"
+STS_NAME="$3"
 SQL="$4"
 
 if [ -z "$SQL" ]; then
-  echo "Usage: $0 <context> <namespace> <pod> \"<SQL>\""
+  echo "Usage: $0 <context> <namespace> <statefulset> \"<SQL>\""
   exit 1
 fi
+
+# 找出所有 pods
+PODS=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" get pods \
+  -l app.kubernetes.io/instance="${STS_NAME}" \
+  -o jsonpath='{.items[*].metadata.name}')
+
+if [ -z "$PODS" ]; then
+  echo "Error: No pods found for StatefulSet ${STS_NAME}"
+  exit 1
+fi
+
+# 找出 Primary pod（@@read_only = 0）
+PRIMARY_POD=""
+for POD in $PODS; do
+  READ_ONLY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+    mysql -N -e "SELECT @@read_only" 2>/dev/null)
+
+  if [ "$READ_ONLY" = "0" ]; then
+    PRIMARY_POD="$POD"
+    break
+  fi
+done
+
+if [ -z "$PRIMARY_POD" ]; then
+  echo "Error: No Primary pod found (all pods are read_only)"
+  echo "Available pods: $PODS"
+  exit 1
+fi
+
+echo "=== Target ==="
+echo "StatefulSet: ${STS_NAME}"
+echo "Primary Pod: ${PRIMARY_POD}"
+echo ""
 
 echo "=== SQL ==="
 echo "$SQL"
 echo ""
 
 echo "=== EXPLAIN ==="
-kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
   mysql -e "EXPLAIN ${SQL}" 2>/dev/null
 
 echo ""
 echo "=== 解讀 ==="
-kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
   mysql -e "
     SELECT
       CASE
@@ -196,6 +230,10 @@ echo "[ ] 統計資訊過時? 試試 ANALYZE TABLE"
 
 **沒用 Index（有問題）**：
 ```
+=== Target ===
+StatefulSet: mariadb
+Primary Pod: mariadb-0
+
 === SQL ===
 SELECT * FROM users WHERE email = 'test@test.com'
 
@@ -220,6 +258,10 @@ SELECT * FROM users WHERE email = 'test@test.com'
 
 **有用 Index（正常）**：
 ```
+=== Target ===
+StatefulSet: mariadb
+Primary Pod: mariadb-1
+
 === EXPLAIN ===
 +----+-------------+-------+------+---------------+-----------+---------+-------+------+-------+
 | id | select_type | table | type | possible_keys | key       | key_len | ref   | rows | Extra |
@@ -247,8 +289,8 @@ Step 2: ./get_sql_by_digest.sh prod mariadb mariadb <digest>
         └── 得到完整 SQL
         │
         ▼
-Step 3: ./analyze_sql.sh prod mariadb mariadb-0 "<SQL>"
-        └── 看 EXPLAIN 結果
+Step 3: ./analyze_sql.sh prod mariadb mariadb "<SQL>"
+        └── 自動找 Primary pod 執行 EXPLAIN
         │
         ├── type=ALL, possible_keys=none → 需要加 index
         ├── type=ALL, possible_keys 有值 → Optimizer 選擇不用，可能正常
@@ -297,7 +339,7 @@ sequence:
 
 ```yaml
 name: Analyze SQL
-description: 分析 SQL 的執行計畫
+description: 分析 SQL 的執行計畫（自動選擇 Primary pod）
 options:
   - name: CONTEXT
     description: Kubernetes context
@@ -306,10 +348,10 @@ options:
     description: MariaDB namespace
     required: true
     default: mariadb
-  - name: POD
-    description: Pod name (use primary)
+  - name: STATEFULSET
+    description: StatefulSet name
     required: true
-    default: mariadb-0
+    default: mariadb
   - name: SQL
     description: SQL to analyze
     required: true
@@ -319,6 +361,6 @@ sequence:
         /path/to/analyze_sql.sh \
           "@option.CONTEXT@" \
           "@option.NAMESPACE@" \
-          "@option.POD@" \
+          "@option.STATEFULSET@" \
           "@option.SQL@"
 ```
