@@ -59,6 +59,7 @@ for POD in $PODS; do
     ROLE=$(get_role "$POD")
     echo "Role: ${ROLE}"
 
+    # 先查 history（每個 thread 最近 N 筆，最快消失）
     RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
       mariadb -u root -p"${MYSQL_PWD}" -e "
         SELECT IFNULL(CURRENT_SCHEMA, 'N/A') AS schema_name,
@@ -69,14 +70,33 @@ for POD in $PODS; do
         WHERE DIGEST = '${DIGEST}'
         ORDER BY EVENT_ID DESC
         LIMIT 2
-      ")
+      \G")
 
     if [ -n "$RESULT" ]; then
-      echo "[Found]"
+      echo "[Found in history]"
       echo "$RESULT"
       FOUND=1
     else
-      echo "[Not found in history]"
+      # fallback: 查 history_long（全域保留，筆數多但也會被淘汰）
+      RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+        mariadb -u root -p"${MYSQL_PWD}" -e "
+          SELECT IFNULL(CURRENT_SCHEMA, 'N/A') AS schema_name,
+                 SQL_TEXT AS sql_text,
+                 ROWS_EXAMINED AS rows_examined,
+                 ROWS_SENT AS rows_sent
+          FROM performance_schema.events_statements_history_long
+          WHERE DIGEST = '${DIGEST}'
+          ORDER BY EVENT_ID DESC
+          LIMIT 2
+        \G")
+
+      if [ -n "$RESULT" ]; then
+        echo "[Found in history_long]"
+        echo "$RESULT"
+        FOUND=1
+      else
+        echo "[Not found in history]"
+      fi
     fi
     echo ""
   else
@@ -87,6 +107,17 @@ for POD in $PODS; do
         WHERE DIGEST = '${DIGEST}'
         LIMIT 1
       ")
+
+    # fallback: 查 history_long
+    if [ -z "$RESULT" ]; then
+      RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+        mariadb -u root -p"${MYSQL_PWD}" -N -e "
+          SELECT SQL_TEXT
+          FROM performance_schema.events_statements_history_long
+          WHERE DIGEST = '${DIGEST}'
+          LIMIT 1
+        ")
+    fi
 
     if [ -n "$RESULT" ]; then
       ROLE=$(get_role "$POD")
@@ -109,7 +140,7 @@ if [ "$FOUND" -eq 0 ] || [ "$VERBOSE" = "--verbose" ]; then
                COUNT_STAR AS total_exec
         FROM performance_schema.events_statements_summary_by_digest
         WHERE DIGEST = '${DIGEST}'
-      ")
+      \G")
 
     if [ -n "$SUMMARY" ]; then
       echo "[${POD}] (${ROLE})"
@@ -137,18 +168,18 @@ Digest: abc123def456...
 
 === Digest Pattern (from summary) ===
 [mariadb-0] (Primary)
-+-------------+------------------------------------------+----------------+------------+
-| schema_name | pattern                                  | no_index_count | total_exec |
-+-------------+------------------------------------------+----------------+------------+
-| myapp       | SELECT * FROM users WHERE email = ?      |           5000 |       5000 |
-+-------------+------------------------------------------+----------------+------------+
+*************************** 1. row ***************************
+   schema_name: myapp
+       pattern: SELECT * FROM `users` WHERE `email` = ?
+no_index_count: 5000
+    total_exec: 5000
 
 [mariadb-1] (Replica)
-+-------------+------------------------------------------+----------------+------------+
-| schema_name | pattern                                  | no_index_count | total_exec |
-+-------------+------------------------------------------+----------------+------------+
-| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
-+-------------+------------------------------------------+----------------+------------+
+*************************** 1. row ***************************
+   schema_name: myapp
+       pattern: SELECT * FROM `users` WHERE `email` = ?
+no_index_count: 50000
+    total_exec: 50000
 ```
 
 **完整版（--verbose）**：
@@ -158,49 +189,49 @@ Digest: abc123def456...
 ----------------------------------------
 Pod: mariadb-0
 Role: Primary
-[Found]
-+-------------+----------------------------------------------------+---------------+-----------+
-| schema_name | sql_text                                           | rows_examined | rows_sent |
-+-------------+----------------------------------------------------+---------------+-----------+
-| myapp       | SELECT * FROM users WHERE email = 'test@test.com'  |         50000 |         1 |
-+-------------+----------------------------------------------------+---------------+-----------+
+[Found in history]
+*************************** 1. row ***************************
+  schema_name: myapp
+     sql_text: SELECT * FROM users WHERE email = 'test@test.com'
+rows_examined: 50000
+    rows_sent: 1
 
 ----------------------------------------
 Pod: mariadb-1
 Role: Replica
-[Not found in history]
+[Found in history_long]
+*************************** 1. row ***************************
+  schema_name: myapp
+     sql_text: SELECT * FROM users WHERE email = 'another@test.com'
+rows_examined: 50000
+    rows_sent: 1
 
 ----------------------------------------
 Pod: mariadb-2
 Role: Replica
-[Found]
-+-------------+----------------------------------------------------+---------------+-----------+
-| schema_name | sql_text                                           | rows_examined | rows_sent |
-+-------------+----------------------------------------------------+---------------+-----------+
-| myapp       | SELECT * FROM users WHERE email = 'foo@bar.com'    |         50000 |         1 |
-+-------------+----------------------------------------------------+---------------+-----------+
+[Not found in history]
 
 === Digest Pattern (from summary) ===
 [mariadb-0] (Primary)
-+-------------+------------------------------------------+----------------+------------+
-| schema_name | pattern                                  | no_index_count | total_exec |
-+-------------+------------------------------------------+----------------+------------+
-| myapp       | SELECT * FROM users WHERE email = ?      |           5000 |       5000 |
-+-------------+------------------------------------------+----------------+------------+
+*************************** 1. row ***************************
+   schema_name: myapp
+       pattern: SELECT * FROM `users` WHERE `email` = ?
+no_index_count: 5000
+    total_exec: 5000
 
 [mariadb-1] (Replica)
-+-------------+------------------------------------------+----------------+------------+
-| schema_name | pattern                                  | no_index_count | total_exec |
-+-------------+------------------------------------------+----------------+------------+
-| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
-+-------------+------------------------------------------+----------------+------------+
+*************************** 1. row ***************************
+   schema_name: myapp
+       pattern: SELECT * FROM `users` WHERE `email` = ?
+no_index_count: 50000
+    total_exec: 50000
 
 [mariadb-2] (Replica)
-+-------------+------------------------------------------+----------------+------------+
-| schema_name | pattern                                  | no_index_count | total_exec |
-+-------------+------------------------------------------+----------------+------------+
-| myapp       | SELECT * FROM users WHERE email = ?      |          50000 |      50000 |
-+-------------+------------------------------------------+----------------+------------+
+*************************** 1. row ***************************
+   schema_name: myapp
+       pattern: SELECT * FROM `users` WHERE `email` = ?
+no_index_count: 50000
+    total_exec: 50000
 ```
 
 ---
