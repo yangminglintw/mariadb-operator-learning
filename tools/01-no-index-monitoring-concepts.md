@@ -85,6 +85,135 @@ Replica: 記錄 Replication SQL + SELECT（如果有讀寫分離）
 
 ---
 
+## mysqld_exporter 指標
+
+### 在監控流程中的角色
+
+```
+┌─────────────────┐    ┌──────────────────┐    ┌────────────┐    ┌─────────┐
+│ Performance     │    │ mysqld_exporter  │    │ Prometheus │    │ Grafana │
+│ Schema          │───▶│                  │───▶│            │───▶│         │
+│ (events_state-  │    │ (轉換成 metrics) │    │ (存儲)     │    │ (視覺化)│
+│  ments_summary) │    │                  │    │            │    │         │
+└─────────────────┘    └──────────────────┘    └────────────┘    └─────────┘
+```
+
+### 指標完整清單
+
+前綴：`mysql_perf_schema_events_statements`
+
+| Metric 後綴 | 來源欄位 | 說明 |
+|------------|---------|------|
+| `_total` | `COUNT_STAR` | 執行總次數 |
+| `_seconds_total` | `SUM_TIMER_WAIT` | 執行總時間 |
+| `_errors_total` | `SUM_ERRORS` | 錯誤次數 |
+| `_warnings_total` | `SUM_WARNINGS` | 警告次數 |
+| `_rows_affected_total` | `SUM_ROWS_AFFECTED` | 影響行數 |
+| `_rows_sent_total` | `SUM_ROWS_SENT` | 返回行數 |
+| `_rows_examined_total` | `SUM_ROWS_EXAMINED` | 檢查行數 |
+| `_tmp_tables_total` | `SUM_CREATED_TMP_TABLES` | 記憶體臨時表 |
+| `_tmp_disk_tables_total` | `SUM_CREATED_TMP_DISK_TABLES` | 磁碟臨時表 |
+| `_sort_rows_total` | `SUM_SORT_ROWS` | 排序行數 |
+| `_sort_merge_passes_total` | `SUM_SORT_MERGE_PASSES` | 排序合併次數 |
+| `_no_index_used_total` | `SUM_NO_INDEX_USED` | 無索引執行次數 |
+| `_no_good_index_used_total` | `SUM_NO_GOOD_INDEX_USED` | 沒有好索引次數 |
+| `_lock_time_seconds_total` | `SUM_LOCK_TIME` | 鎖定時間 |
+
+### 標籤 (Labels)
+
+| Label | 來源 | 說明 |
+|-------|------|------|
+| `schema` | `SCHEMA_NAME` | 資料庫名稱 |
+| `digest` | `DIGEST` | 查詢 hash（用於關聯） |
+| `digest_text` | `DIGEST_TEXT` | 標準化 SQL（參數變成 ?） |
+
+### 收集器設定
+
+```bash
+mysqld_exporter \
+  --collect.perf_schema.eventsstatements \
+  --collect.perf_schema.eventsstatements.limit=500 \
+  --collect.perf_schema.eventsstatements.digest_text_limit=200
+```
+
+| 參數 | 說明 | 預設值 |
+|------|------|--------|
+| `--collect.perf_schema.eventsstatements` | 啟用收集 | false |
+| `--collect.perf_schema.eventsstatements.limit` | 最多收集幾筆 | 250 |
+| `--collect.perf_schema.eventsstatements.digest_text_limit` | digest_text 最大長度 | 120 |
+
+### PromQL 範例
+
+**告警用：**
+
+```promql
+# 無索引查詢速率 > 100/min
+rate(mysql_perf_schema_events_statements_no_index_used_total[5m]) * 60 > 100
+
+# 無索引查詢佔比 > 50%
+rate(mysql_perf_schema_events_statements_no_index_used_total[5m])
+/ rate(mysql_perf_schema_events_statements_total[5m]) > 0.5
+
+# 單次查詢檢查行數超過 10000
+mysql_perf_schema_events_statements_rows_examined_total
+/ mysql_perf_schema_events_statements_total > 10000
+```
+
+**Dashboard 用：**
+
+```promql
+# 速率趨勢圖
+rate(mysql_perf_schema_events_statements_no_index_used_total[5m])
+
+# Top 10 無索引查詢
+topk(10,
+  rate(mysql_perf_schema_events_statements_no_index_used_total[5m])
+) by (schema, digest_text)
+```
+
+**修復驗證用：**
+
+```promql
+# 特定 digest 的 rate = 0 表示問題已修復
+rate(mysql_perf_schema_events_statements_no_index_used_total{digest="abc123"}[5m]) == 0
+```
+
+### 告警規則範本
+
+```yaml
+groups:
+- name: mysql-no-index-alerts
+  rules:
+  - alert: MySQLNoIndexQueryHigh
+    expr: |
+      rate(mysql_perf_schema_events_statements_no_index_used_total[5m]) * 60 > 100
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High rate of queries without index"
+      description: |
+        Schema: {{ $labels.schema }}
+        Digest: {{ $labels.digest_text }}
+        Rate: {{ $value | printf "%.1f" }}/min
+
+  - alert: MySQLQueryLowEfficiency
+    expr: |
+      mysql_perf_schema_events_statements_rows_examined_total
+      / mysql_perf_schema_events_statements_total > 10000
+    for: 10m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Query examining too many rows"
+      description: |
+        Schema: {{ $labels.schema }}
+        Digest: {{ $labels.digest_text }}
+        Rows examined per query: {{ $value | printf "%.0f" }}
+```
+
+---
+
 ## Metrics 是累計值
 
 ### 重要觀念
