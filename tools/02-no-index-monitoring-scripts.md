@@ -236,21 +236,26 @@ no_index_count: 50000
 
 ---
 
-## 腳本 2：分析 SQL
+## 腳本 2：分析 SQL（增強版）
 
 ```bash
 #!/bin/bash
-# analyze_sql.sh
-# 用法：./analyze_sql.sh <context> <namespace> <statefulset> "<SQL>"
+# analyze_sql.sh (增強版)
+# 用法：./analyze_sql.sh <context> <namespace> <statefulset> "<SQL>" [--analyze]
 # 自動找到 Primary pod 執行 EXPLAIN
+# --analyze: 執行 EXPLAIN ANALYZE 顯示實際執行時間
 
 CONTEXT="$1"
 NAMESPACE="$2"
 STS_NAME="$3"
 SQL="$4"
+ANALYZE_FLAG="$5"
 
 if [ -z "$SQL" ]; then
-  echo "Usage: $0 <context> <namespace> <statefulset> \"<SQL>\""
+  echo "Usage: $0 <context> <namespace> <statefulset> \"<SQL>\" [--analyze]"
+  echo ""
+  echo "Options:"
+  echo "  --analyze    執行 EXPLAIN ANALYZE（會實際執行 SQL）"
   exit 1
 fi
 
@@ -275,6 +280,18 @@ if [ -z "$PRIMARY_POD" ]; then
   exit 1
 fi
 
+# Helper: 執行 SQL（無格式）
+run_sql() {
+  kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
+    mariadb -u root -p"${MYSQL_PWD}" -N -e "$1" 2>/dev/null
+}
+
+# Helper: 執行 SQL（表格格式）
+run_sql_pretty() {
+  kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
+    mariadb -u root -p"${MYSQL_PWD}" -e "$1" 2>/dev/null
+}
+
 echo "=== Target ==="
 echo "StatefulSet: ${STS_NAME}"
 echo "Primary Pod: ${PRIMARY_POD}"
@@ -284,28 +301,103 @@ echo "=== SQL ==="
 echo "$SQL"
 echo ""
 
+# ========== 新增：Table Structure ==========
+echo "=== Table Structure ==="
+
+# 抽取 table 名稱 (FROM, JOIN, UPDATE, INTO)
+TABLES=$(echo "$SQL" | grep -oiE '(FROM|JOIN|UPDATE|INTO)\s+`?[a-zA-Z_][a-zA-Z0-9_]*`?' | \
+         sed -E 's/(FROM|JOIN|UPDATE|INTO)\s+`?//gi' | tr -d '`' | sort -u)
+
+for TABLE in $TABLES; do
+  echo "--- $TABLE ---"
+
+  # 顯示 CREATE TABLE（含 indexes）
+  run_sql_pretty "SHOW CREATE TABLE $TABLE\G" | grep -v "^\*\*\*"
+
+  # 顯示資料量
+  ROW_COUNT=$(run_sql "SELECT COUNT(*) FROM $TABLE")
+  echo "Rows: $ROW_COUNT"
+
+  if [ -n "$ROW_COUNT" ] && [ "$ROW_COUNT" -lt 1000 ]; then
+    echo "Note: 小表，Full Scan 可能是正常的"
+  fi
+  echo ""
+done
+
+# ========== EXPLAIN ==========
 echo "=== EXPLAIN ==="
-kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
-  mariadb -u root -p"${MYSQL_PWD}" -e "EXPLAIN ${SQL}"
-
+run_sql_pretty "EXPLAIN ${SQL}"
 echo ""
+
+# ========== EXPLAIN ANALYZE（可選）==========
+if [ "$ANALYZE_FLAG" = "--analyze" ]; then
+  echo "=== EXPLAIN ANALYZE ==="
+  echo "(實際執行 SQL，顯示真實時間和行數)"
+  run_sql_pretty "EXPLAIN ANALYZE ${SQL}"
+  echo ""
+fi
+
+# ========== 解讀 ==========
 echo "=== 解讀 ==="
-kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${PRIMARY_POD}" -c mariadb -- \
-  mariadb -u root -p"${MYSQL_PWD}" -e "
-    SELECT
-      CASE
-        WHEN type = 'ALL' THEN '!! Full Table Scan'
-        WHEN type = 'index' THEN '! Full Index Scan'
-        WHEN type IN ('ref', 'eq_ref', 'range', 'const') THEN 'OK - Using Index'
-        ELSE CONCAT('type=', type)
-      END AS diagnosis,
-      IFNULL(possible_keys, 'none') AS possible_indexes,
-      IFNULL(key, 'none') AS actual_index,
-      rows AS estimated_rows
-    FROM (EXPLAIN ${SQL}) AS e
-  "
+run_sql_pretty "
+  SELECT
+    CASE
+      WHEN type = 'ALL' THEN '!! Full Table Scan'
+      WHEN type = 'index' THEN '! Full Index Scan'
+      WHEN type IN ('ref', 'eq_ref', 'range', 'const') THEN 'OK - Using Index'
+      ELSE CONCAT('type=', type)
+    END AS diagnosis,
+    IFNULL(possible_keys, 'none') AS possible_indexes,
+    IFNULL(key, 'none') AS actual_index,
+    rows AS estimated_rows
+  FROM (EXPLAIN ${SQL}) AS e
+"
+echo ""
+
+# ========== 新增：Index Suggestion ==========
+echo "=== Index Suggestion ==="
+
+# 抽取 WHERE 和 AND 條件的欄位
+WHERE_COLS=$(echo "$SQL" | grep -oiE '(WHERE|AND|OR)\s+`?[a-zA-Z_][a-zA-Z0-9_]*`?\s*(=|>|<|LIKE|IN)' | \
+             sed -E 's/(WHERE|AND|OR)\s+`?//gi' | sed -E 's/\s*(=|>|<|LIKE|IN).*//i' | tr -d '`' | sort -u)
+
+# 抽取 JOIN ON 條件的欄位
+JOIN_COLS=$(echo "$SQL" | grep -oiE 'ON\s+`?[a-zA-Z_][a-zA-Z0-9_.]*`?\s*=' | \
+            sed -E 's/ON\s+`?//gi' | sed 's/\s*=//g' | tr -d '`' | sort -u)
+
+HAS_SUGGESTION=0
+
+if [ -n "$WHERE_COLS" ]; then
+  echo "WHERE 條件欄位："
+  for COL in $WHERE_COLS; do
+    echo "  - $COL"
+  done
+  echo ""
+  echo "建議 Index（如果還沒有）："
+  for TABLE in $TABLES; do
+    for COL in $WHERE_COLS; do
+      echo "  ALTER TABLE $TABLE ADD INDEX idx_${COL} (${COL});"
+    done
+  done
+  HAS_SUGGESTION=1
+fi
+
+if [ -n "$JOIN_COLS" ]; then
+  echo ""
+  echo "JOIN 條件欄位："
+  for COL in $JOIN_COLS; do
+    echo "  - $COL"
+  done
+  HAS_SUGGESTION=1
+fi
+
+if [ "$HAS_SUGGESTION" -eq 0 ]; then
+  echo "無法從 SQL 自動抽取建議，請手動檢查 WHERE/JOIN 條件"
+fi
 
 echo ""
+
+# ========== 檢查清單 ==========
 echo "=== 檢查清單 ==="
 echo "[ ] type=ALL? 需要加 Index"
 echo "[ ] possible_keys 有值但 key 是 NULL? Optimizer 選擇不用（可能正常）"
@@ -326,6 +418,18 @@ Primary Pod: mariadb-0
 === SQL ===
 SELECT * FROM users WHERE email = 'test@test.com'
 
+=== Table Structure ===
+--- users ---
+       Table: users
+Create Table: CREATE TABLE `users` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `email` varchar(255) DEFAULT NULL,
+  `name` varchar(100) DEFAULT NULL,
+  `created_at` datetime DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+Rows: 100000
+
 === EXPLAIN ===
 +----+-------------+-------+------+---------------+------+---------+------+--------+-------------+
 | id | select_type | table | type | possible_keys | key  | key_len | ref  | rows   | Extra       |
@@ -340,9 +444,20 @@ SELECT * FROM users WHERE email = 'test@test.com'
 | !! Full Table Scan   | none             | none         | 100000         |
 +----------------------+------------------+--------------+----------------+
 
+=== Index Suggestion ===
+WHERE 條件欄位：
+  - email
+
+建議 Index（如果還沒有）：
+  ALTER TABLE users ADD INDEX idx_email (email);
+
 === 檢查清單 ===
 [ ] type=ALL? 需要加 Index
-...
+[ ] possible_keys 有值但 key 是 NULL? Optimizer 選擇不用（可能正常）
+[ ] WHERE 條件有 Function? 例如 YEAR(date)
+[ ] 有隱式型別轉換? VARCHAR vs INT
+[ ] LIKE 開頭是 %?
+[ ] 統計資訊過時? 試試 ANALYZE TABLE
 ```
 
 **有用 Index（正常）**：
@@ -350,6 +465,22 @@ SELECT * FROM users WHERE email = 'test@test.com'
 === Target ===
 StatefulSet: mariadb
 Primary Pod: mariadb-1
+
+=== SQL ===
+SELECT * FROM users WHERE email = 'test@test.com'
+
+=== Table Structure ===
+--- users ---
+       Table: users
+Create Table: CREATE TABLE `users` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `email` varchar(255) DEFAULT NULL,
+  `name` varchar(100) DEFAULT NULL,
+  `created_at` datetime DEFAULT current_timestamp(),
+  PRIMARY KEY (`id`),
+  KEY `idx_email` (`email`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+Rows: 100000
 
 === EXPLAIN ===
 +----+-------------+-------+------+---------------+-----------+---------+-------+------+-------+
@@ -364,6 +495,90 @@ Primary Pod: mariadb-1
 +------------------+------------------+--------------+----------------+
 | OK - Using Index | idx_email        | idx_email    | 1              |
 +------------------+------------------+--------------+----------------+
+
+=== Index Suggestion ===
+WHERE 條件欄位：
+  - email
+
+建議 Index（如果還沒有）：
+  ALTER TABLE users ADD INDEX idx_email (email);
+
+=== 檢查清單 ===
+[ ] type=ALL? 需要加 Index
+...
+```
+
+**JOIN 查詢範例**：
+```
+=== Target ===
+StatefulSet: mariadb
+Primary Pod: mariadb-0
+
+=== SQL ===
+SELECT u.name, o.total FROM users u JOIN orders o ON u.id = o.user_id WHERE o.status = 'pending'
+
+=== Table Structure ===
+--- users ---
+       Table: users
+Create Table: CREATE TABLE `users` (...)
+Rows: 100000
+
+--- orders ---
+       Table: orders
+Create Table: CREATE TABLE `orders` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `user_id` int(11) DEFAULT NULL,
+  `status` varchar(20) DEFAULT NULL,
+  `total` decimal(10,2) DEFAULT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+Rows: 500000
+
+=== EXPLAIN ===
+...
+
+=== Index Suggestion ===
+WHERE 條件欄位：
+  - status
+
+建議 Index（如果還沒有）：
+  ALTER TABLE users ADD INDEX idx_status (status);
+  ALTER TABLE orders ADD INDEX idx_status (status);
+
+JOIN 條件欄位：
+  - u.id
+  - o.user_id
+
+=== 檢查清單 ===
+...
+```
+
+**小表範例（Full Scan 正常）**：
+```
+=== Table Structure ===
+--- config ---
+       Table: config
+Create Table: CREATE TABLE `config` (...)
+Rows: 50
+Note: 小表，Full Scan 可能是正常的
+
+=== 解讀 ===
++----------------------+------------------+--------------+----------------+
+| diagnosis            | possible_indexes | actual_index | estimated_rows |
++----------------------+------------------+--------------+----------------+
+| !! Full Table Scan   | none             | none         | 50             |
++----------------------+------------------+--------------+----------------+
+```
+
+**EXPLAIN ANALYZE 範例（--analyze flag）**：
+```
+=== EXPLAIN ANALYZE ===
+(實際執行 SQL，顯示真實時間和行數)
++----+-------------+-------+------+---------------+-----------+---------+-------+------+----------+------------+
+| id | select_type | table | type | possible_keys | key       | key_len | ref   | rows | r_rows   | r_time_ms  |
++----+-------------+-------+------+---------------+-----------+---------+-------+------+----------+------------+
+|  1 | SIMPLE      | users | ref  | idx_email     | idx_email | 767     | const |    1 |     1.00 |       0.05 |
++----+-------------+-------+------+---------------+-----------+---------+-------+------+----------+------------+
 ```
 
 ---
@@ -444,6 +659,9 @@ options:
   - name: SQL
     description: SQL to analyze
     required: true
+  - name: ANALYZE
+    description: 執行 EXPLAIN ANALYZE（會實際執行 SQL）
+    values: ["", "--analyze"]
 sequence:
   commands:
     - script: |
@@ -451,5 +669,6 @@ sequence:
           "@option.CONTEXT@" \
           "@option.NAMESPACE@" \
           "@option.STATEFULSET@" \
-          "@option.SQL@"
+          "@option.SQL@" \
+          @option.ANALYZE@
 ```
