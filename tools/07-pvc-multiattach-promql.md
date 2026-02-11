@@ -106,9 +106,23 @@ kubectl --context=kind-mdb get volumeattachment \
 ### 指標值說明
 
 ```
-kube_node_status_condition{condition="Ready", status="true"} == 1   → Node 正常
-kube_node_status_condition{condition="Ready", status="true"} == 0   → Node NotReady
+kube_node_status_condition 每個 condition 會產生三個 series：
 
+                          status="true"   status="false"   status="unknown"
+Node Ready（正常）            1                0                0
+Node NotReady（明確故障）      0                1                0
+Node Unknown（kubelet 失聯）   0                0                1
+
+偵測 NotReady 的正確寫法（正向斷言）：
+  kube_node_status_condition{condition="Ready", status="false"} == 1
+    or
+  kube_node_status_condition{condition="Ready", status="unknown"} == 1
+
+⚠ 避免：{status="true"} == 0
+  → series 消失時回傳 empty，不是 0
+```
+
+```
 kube_volumeattachment_status_attached == 1   → Volume 已掛載
 kube_volumeattachment_status_attached == 0   → Volume 未掛載
 
@@ -175,8 +189,10 @@ kube_node_status_condition                          ← 判斷 NotReady
 **Node NotReady：**
 
 ```promql
-# 哪些 node 不健康
-kube_node_status_condition{condition="Ready", status="true"} == 0
+# 哪些 node 不健康（正向斷言：偵測 NotReady 或 Unknown）
+kube_node_status_condition{condition="Ready", status="false"} == 1
+  or
+kube_node_status_condition{condition="Ready", status="unknown"} == 1
 ```
 
 **Pod 卡在 ContainerCreating 超過 5 分鐘：**
@@ -192,9 +208,13 @@ min_over_time(
 
 ```promql
 # StatefulSet pod 跑在 NotReady node 上（風險前兆）
-kube_pod_info{created_by_kind="StatefulSet"}
+(kube_pod_info{created_by_kind="StatefulSet"})
   * on(node) group_left()
-  (kube_node_status_condition{condition="Ready", status="true"} == 0)
+  (
+    kube_node_status_condition{condition="Ready", status="false"} == 1
+      or
+    kube_node_status_condition{condition="Ready", status="unknown"} == 1
+  )
 ```
 
 ### 完整 Join：PVC → PV → VolumeAttachment → Node
@@ -233,7 +253,11 @@ kube_volumeattachment_status_attached == 1
     kube_volumeattachment_spec_source_persistentvolume
 )
   * on(node) group_left()
-  (kube_node_status_condition{condition="Ready", status="true"} == 0)
+  (
+    kube_node_status_condition{condition="Ready", status="false"} == 1
+      or
+    kube_node_status_condition{condition="Ready", status="unknown"} == 1
+  )
 ```
 
 ### PromQL Join 語法說明
@@ -252,9 +276,13 @@ kube_volumeattachment_status_attached == 1
 
 ## 告警規則範本
 
+### 方案 A：with VolumeAttachment（VA metrics 可靠的環境）
+
+適用於 kube-state-metrics 有啟用 `kube_volumeattachment_*` 且在 Node 故障期間 metrics 不會消失的環境。
+
 ```yaml
 groups:
-- name: pvc-multiattach-alerts
+- name: pvc-multiattach-alerts-plan-a
   rules:
 
   # ═══════════════════════════════════════════════
@@ -281,9 +309,13 @@ groups:
   - alert: NodeNotReadyWithStatefulSet
     expr: |
       count by (node) (
-        kube_pod_info{created_by_kind="StatefulSet"}
+        (kube_pod_info{created_by_kind="StatefulSet"})
           * on(node) group_left()
-          (kube_node_status_condition{condition="Ready", status="true"} == 0)
+          (
+            kube_node_status_condition{condition="Ready", status="false"} == 1
+              or
+            kube_node_status_condition{condition="Ready", status="unknown"} == 1
+          )
       ) > 0
     for: 1m
     labels:
@@ -297,6 +329,7 @@ groups:
 
   # ═══════════════════════════════════════════════
   # 告警 3：精確偵測（需要 bridge metric）
+  # ⚠ VA metrics 可能在 Node 故障期間消失，導致此告警不觸發
   # ═══════════════════════════════════════════════
   - alert: VolumeStuckOnNotReadyNode
     expr: |
@@ -306,7 +339,11 @@ groups:
           kube_volumeattachment_spec_source_persistentvolume
       )
         * on(node) group_left()
-        (kube_node_status_condition{condition="Ready", status="true"} == 0)
+        (
+          kube_node_status_condition{condition="Ready", status="false"} == 1
+            or
+          kube_node_status_condition{condition="Ready", status="unknown"} == 1
+        )
     for: 2m
     labels:
       severity: critical
@@ -318,6 +355,84 @@ groups:
         Any pod using this volume on another node will get Multi-Attach error.
 ```
 
+### 方案 B：without VolumeAttachment（VA metrics 不可靠的環境）
+
+不依賴 `kube_volumeattachment_*` 指標，只用 Pod、PVC、Node 層級的 metrics。
+適用於 VA metrics 在 Node 故障時消失或 kube-state-metrics 版本不支援 VA 的環境。
+
+```yaml
+groups:
+- name: pvc-multiattach-alerts-plan-b
+  rules:
+
+  # ═══════════════════════════════════════════════
+  # 告警 1：症狀偵測（同方案 A）
+  # ═══════════════════════════════════════════════
+  - alert: PodStuckContainerCreating
+    expr: |
+      min_over_time(
+        kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
+      ) == 1
+    for: 5m
+    labels:
+      severity: warning
+    annotations:
+      summary: "Pod stuck in ContainerCreating"
+      description: |
+        Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }}
+        has been in ContainerCreating for more than 5 minutes.
+        Possible causes: Multi-Attach error, image pull failure, secret not found.
+
+  # ═══════════════════════════════════════════════
+  # 告警 2：前兆偵測（同方案 A）
+  # ═══════════════════════════════════════════════
+  - alert: NodeNotReadyWithStatefulSet
+    expr: |
+      count by (node) (
+        (kube_pod_info{created_by_kind="StatefulSet"})
+          * on(node) group_left()
+          (
+            kube_node_status_condition{condition="Ready", status="false"} == 1
+              or
+            kube_node_status_condition{condition="Ready", status="unknown"} == 1
+          )
+      ) > 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "NotReady node has StatefulSet pods"
+      description: |
+        Node {{ $labels.node }} is NotReady and has StatefulSet pods.
+        These pods use RWO PVC and may encounter Multi-Attach errors
+        when rescheduled to another node.
+
+  # ═══════════════════════════════════════════════
+  # 告警 3：StatefulSet Pod 使用 PVC 且卡在 ContainerCreating
+  # 不依賴 VolumeAttachment metrics
+  # ═══════════════════════════════════════════════
+  - alert: StatefulSetPodPendingWithPVC
+    expr: |
+      (
+        min_over_time(
+          kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
+        ) == 1
+      )
+        * on(namespace, pod) group_left(persistentvolumeclaim)
+        kube_pod_spec_volumes_persistentvolumeclaims_info
+        * on(namespace, pod) group_left(created_by_name)
+        kube_pod_info{created_by_kind="StatefulSet"}
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "StatefulSet pod with PVC stuck in ContainerCreating"
+      description: |
+        Pod {{ $labels.namespace }}/{{ $labels.pod }} (StatefulSet: {{ $labels.created_by_name }})
+        is stuck in ContainerCreating and uses PVC {{ $labels.persistentvolumeclaim }}.
+        This is likely a Multi-Attach error caused by a node failure.
+```
+
 ---
 
 ## 監控策略比較
@@ -326,20 +441,37 @@ groups:
 |------|--------|--------|----------|----------|
 | 症狀偵測（ContainerCreating > 5min） | 高 | 中 | kube-state-metrics | 通用告警，涵蓋多種原因 |
 | 前兆偵測（NotReady + StatefulSet） | 高 | 中 | kube-state-metrics | 提前警告，但可能誤報 |
-| Join 到 VolumeAttachment（bridge） | 高 | 高 | kube-state-metrics 有 `spec_source` 指標 | 精確偵測 volume 卡住 |
+| Join 到 VolumeAttachment（bridge）— 方案 A | 高 | 高 | VA metrics 可靠 | 精確偵測 volume 卡住 |
+| StatefulSet + PVC 偵測 — 方案 B | 高 | 中高 | 僅 Pod/PVC metrics | VA metrics 不可靠時的替代 |
 | Event exporter | 最精確 | 高 | 需額外部署 event-exporter | 捕捉 `FailedAttachVolume` 事件 |
+
+### 方案選擇指南
+
+```
+先確認你的環境：
+  kubectl get --raw /metrics | grep kube_volumeattachment_status_attached
+  → 有結果且 Node 故障時不消失 → 用方案 A
+  → 沒有結果或 Node 故障時消失 → 用方案 B
+```
 
 ### 建議組合
 
 ```
-Layer 1（症狀）：PodStuckContainerCreating
-  └── 最簡單，覆蓋面廣，5 分鐘內告警
+方案 A（VA metrics 可靠）：
+  Layer 1（症狀）：PodStuckContainerCreating
+    └── 最簡單，覆蓋面廣，5 分鐘內告警
+  Layer 2（前兆）：NodeNotReadyWithStatefulSet
+    └── Node 一 NotReady 就告警，讓 on-call 提前準備
+  Layer 3（精確）：VolumeStuckOnNotReadyNode
+    └── 精確定位哪個 volume 卡住，需要 bridge metric 存在
 
-Layer 2（前兆）：NodeNotReadyWithStatefulSet
-  └── Node 一 NotReady 就告警，讓 on-call 提前準備
-
-Layer 3（精確）：VolumeStuckOnNotReadyNode
-  └── 精確定位哪個 volume 卡住，需要 bridge metric 存在
+方案 B（VA metrics 不可靠）：
+  Layer 1（症狀）：PodStuckContainerCreating
+    └── 同上
+  Layer 2（前兆）：NodeNotReadyWithStatefulSet
+    └── 同上
+  Layer 3（關聯）：StatefulSetPodPendingWithPVC
+    └── 不依賴 VA，用 Pod + PVC + StatefulSet 關聯偵測
 ```
 
 ---
@@ -377,6 +509,50 @@ kubectl --context=kind-mdb -n monitoring get deploy kube-state-metrics \
 
 不需要 rate()，直接比較值即可。
 這和之前的 mysql_perf_schema_* metrics（counter，需要 rate()）不同。
+```
+
+### Prometheus 查詢的 empty 陷阱
+
+```
+問題：為什麼 {status="true"} == 0 在 Node 故障時回傳 empty？
+
+Prometheus 的比較運算子（==, !=, >, <）只對「存在的 series」運算。
+如果一個 series 完全不存在（或已 stale），== 0 不會回傳 0，而是什麼都不回傳。
+```
+
+**Node condition 的三態模型：**
+
+```
+kube_node_status_condition{condition="Ready"} 有三個 series：
+  status="true"     → 正常時 = 1，故障時 = 0（或 series 消失）
+  status="false"    → NotReady 時 = 1
+  status="unknown"  → kubelet 失聯時 = 1
+
+kubelet 失聯時的狀態是 Unknown，不是 False！
+  → 如果只查 status="false"，會漏掉 kubelet 失聯的情況
+  → 正確做法：同時查 status="false" 和 status="unknown"
+```
+
+**VolumeAttachment metrics 的消失問題：**
+
+```
+Node 故障時，kube-state-metrics 可能無法 scrape 到 VolumeAttachment metrics：
+  → kube_volumeattachment_status_attached series 變成 stale 後被 Prometheus 移除
+  → 任何依賴 VA metrics 的 join chain 都會回傳 empty
+
+這就是為什麼需要方案 B（不依賴 VA metrics）作為備案。
+```
+
+**經驗法則：**
+
+```
+✗ 反向斷言（fragile）：metric{status="true"} == 0
+  → series 消失時回傳 empty
+
+✓ 正向斷言（robust）：metric{status="false"} == 1
+  → 只要故障 series 存在就會觸發
+
+永遠用正向斷言偵測異常狀態。
 ```
 
 ### kubelet 相關參數
