@@ -225,7 +225,7 @@ min_over_time(
 # PVC → PV（透過 kube_persistentvolumeclaim_info）
 # PV → VA（透過 bridge metric）
 # VA → attached + node
-kube_volumeattachment_status_attached == 1
+(kube_volumeattachment_status_attached == 1)
   * on(volumeattachment) group_left(volumename)
   kube_volumeattachment_spec_source_persistentvolume
 ```
@@ -235,7 +235,7 @@ kube_volumeattachment_status_attached == 1
 ```promql
 # 完整鏈：VA attached status + PV name + PVC name
 (
-  kube_volumeattachment_status_attached == 1
+  (kube_volumeattachment_status_attached == 1)
     * on(volumeattachment) group_left(volumename)
     kube_volumeattachment_spec_source_persistentvolume
 )
@@ -248,7 +248,7 @@ kube_volumeattachment_status_attached == 1
 ```promql
 # 核心告警查詢：volume 還 attached 在一個 NotReady 的 node 上
 (
-  kube_volumeattachment_status_attached == 1
+  (kube_volumeattachment_status_attached == 1)
     * on(volumeattachment) group_left(volumename)
     kube_volumeattachment_spec_source_persistentvolume
 )
@@ -334,7 +334,7 @@ groups:
   - alert: VolumeStuckOnNotReadyNode
     expr: |
       (
-        kube_volumeattachment_status_attached == 1
+        (kube_volumeattachment_status_attached == 1)
           * on(volumeattachment) group_left(volumename)
           kube_volumeattachment_spec_source_persistentvolume
       )
@@ -414,14 +414,16 @@ groups:
   - alert: StatefulSetPodPendingWithPVC
     expr: |
       (
-        min_over_time(
-          kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
-        ) == 1
+        (
+          min_over_time(
+            kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
+          ) == 1
+        )
+          * on(namespace, pod) group_left(created_by_name)
+          kube_pod_info{created_by_kind="StatefulSet"}
       )
-        * on(namespace, pod) group_left(persistentvolumeclaim)
+        and on(namespace, pod)
         kube_pod_spec_volumes_persistentvolumeclaims_info
-        * on(namespace, pod) group_left(created_by_name)
-        kube_pod_info{created_by_kind="StatefulSet"}
     for: 5m
     labels:
       severity: critical
@@ -429,7 +431,7 @@ groups:
       summary: "StatefulSet pod with PVC stuck in ContainerCreating"
       description: |
         Pod {{ $labels.namespace }}/{{ $labels.pod }} (StatefulSet: {{ $labels.created_by_name }})
-        is stuck in ContainerCreating and uses PVC {{ $labels.persistentvolumeclaim }}.
+        is stuck in ContainerCreating and uses a PVC.
         This is likely a Multi-Attach error caused by a node failure.
 ```
 
