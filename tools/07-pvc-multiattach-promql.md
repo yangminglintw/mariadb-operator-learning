@@ -11,10 +11,10 @@ Node A (NotReady) ── mariadb-chaos-1 pod (Terminating，但 kubelet 沒回�
                               │
                               ▼ RWO PVC（還掛在 Node A）
                               │
-Node B ── mariadb-chaos-1 pod (ContainerCreating，等 volume detach)
+Node B ── mariadb-chaos-1 pod (Pending，等 volume detach)
                               └── Multi-Attach error！
 
-結果：新 pod 卡在 ContainerCreating，直到舊 node 上的 volume 被強制 detach
+結果：新 pod 卡在 Pending（Init:0/N 或 ContainerCreating），直到舊 node 上的 volume 被強制 detach
 ```
 
 ### 為什麼 StatefulSet 特別容易遇到
@@ -31,7 +31,7 @@ Node B ── mariadb-chaos-1 pod (ContainerCreating，等 volume detach)
 T+0s    Node A 變成 NotReady（kubelet 失聯）
 T+40s   Node controller 標記 pod 為 Terminating（但 kubelet 不回應，pod 不會真的刪除）
 T+5m    StatefulSet controller 嘗試在 Node B 建立新 pod
-T+5m    新 pod 進入 ContainerCreating
+T+5m    新 pod 進入 Pending（Init:0/N 或 ContainerCreating）
 T+5m    kubelet 嘗試 attach volume → Multi-Attach error（volume 還在 Node A）
 T+6m    默認等待 maxWaitForUnmountDuration (6 min) 後強制 detach
 T+11m+  Volume 終於掛載成功，pod 啟動
@@ -94,7 +94,7 @@ kubectl --context=kind-mdb get volumeattachment \
 | 指標 | 重要 Labels | 用途 |
 |------|-------------|------|
 | `kube_node_status_condition` | node, condition, status | 偵測 Node NotReady |
-| `kube_pod_container_status_waiting_reason` | pod, namespace, container, reason | 偵測 ContainerCreating |
+| `kube_pod_container_status_waiting_reason` | pod, namespace, container, reason | 偵測 ContainerCreating（⚠ 不涵蓋 init container 卡住的情況） |
 | `kube_pod_status_phase` | pod, namespace, phase | Pod 狀態（Pending/Running） |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | pod, namespace, persistentvolumeclaim | Pod → PVC 對應 |
 | `kube_persistentvolumeclaim_info` | persistentvolumeclaim, namespace, storageclass, volumename | PVC → PV 對應 |
@@ -126,7 +126,26 @@ Node Unknown（kubelet 失聯）   0                0                1
 kube_volumeattachment_status_attached == 1   → Volume 已掛載
 kube_volumeattachment_status_attached == 0   → Volume 未掛載
 
-kube_pod_container_status_waiting_reason{reason="ContainerCreating"} == 1  → Pod 等待中
+kube_pod_status_phase{phase="Pending"} == 1  → Pod 卡住（涵蓋 Init:0/N 和 ContainerCreating）
+
+⚠ 為什麼不用 kube_pod_container_status_waiting_reason{reason="ContainerCreating"}：
+  有 init container 的 pod（如 MariaDB Operator），Multi-Attach 時卡在 Init:0/N，
+  此時 regular container 根本還沒開始 → 該 metric 沒有資料。
+  kube_pod_status_phase{phase="Pending"} 涵蓋所有情況，更可靠。
+```
+
+### Init Container 與 Multi-Attach
+
+MariaDB Operator 注入 init containers（如 init、galera-init）。
+Multi-Attach 時的實際表現：
+
+```
+kubectl get pods:
+  mariadb-chaos-1   0/1   Init:0/2   0   5m    ← 不是 ContainerCreating！
+
+原因：Volume mount 在 pod 層級進行，init container 先啟動。
+Volume 掛載失敗 → init container 卡住 → 顯示 Init:0/N
+此時 pod phase = Pending → 用 kube_pod_status_phase{phase="Pending"} 偵測最可靠。
 ```
 
 ---
@@ -195,13 +214,11 @@ kube_node_status_condition{condition="Ready", status="false"} == 1
 kube_node_status_condition{condition="Ready", status="unknown"} == 1
 ```
 
-**Pod 卡在 ContainerCreating 超過 5 分鐘：**
+**Pod 卡住超過 5 分鐘：**
 
 ```promql
-# 偵測 ContainerCreating 持續超過 5 分鐘的 pod
-min_over_time(
-  kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
-) == 1
+# 偵測 pod 持續 Pending 超過 5 分鐘（涵蓋 Init:0/N 和 ContainerCreating）
+min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
 ```
 
 **StatefulSet 的 Pod 在 NotReady node 上：**
@@ -288,20 +305,19 @@ groups:
   # ═══════════════════════════════════════════════
   # 告警 1：症狀偵測（最實用，不需要複雜 join）
   # ═══════════════════════════════════════════════
-  - alert: PodStuckContainerCreating
+  - alert: PodStuckPending
     expr: |
-      min_over_time(
-        kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
-      ) == 1
+      min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
     for: 5m
     labels:
       severity: warning
     annotations:
-      summary: "Pod stuck in ContainerCreating"
+      summary: "Pod stuck in Pending"
       description: |
-        Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }}
-        has been in ContainerCreating for more than 5 minutes.
-        Possible causes: Multi-Attach error, image pull failure, secret not found.
+        Pod {{ $labels.namespace }}/{{ $labels.pod }} has been Pending
+        for more than 5 minutes.
+        Possible causes: Multi-Attach error (Init:0/N), image pull failure,
+        resource quota, node affinity.
 
   # ═══════════════════════════════════════════════
   # 告警 2：前兆偵測（Node NotReady + StatefulSet）
@@ -368,20 +384,19 @@ groups:
   # ═══════════════════════════════════════════════
   # 告警 1：症狀偵測（同方案 A）
   # ═══════════════════════════════════════════════
-  - alert: PodStuckContainerCreating
+  - alert: PodStuckPending
     expr: |
-      min_over_time(
-        kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
-      ) == 1
+      min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
     for: 5m
     labels:
       severity: warning
     annotations:
-      summary: "Pod stuck in ContainerCreating"
+      summary: "Pod stuck in Pending"
       description: |
-        Pod {{ $labels.namespace }}/{{ $labels.pod }} container {{ $labels.container }}
-        has been in ContainerCreating for more than 5 minutes.
-        Possible causes: Multi-Attach error, image pull failure, secret not found.
+        Pod {{ $labels.namespace }}/{{ $labels.pod }} has been Pending
+        for more than 5 minutes.
+        Possible causes: Multi-Attach error (Init:0/N), image pull failure,
+        resource quota, node affinity.
 
   # ═══════════════════════════════════════════════
   # 告警 2：前兆偵測（同方案 A）
@@ -408,17 +423,13 @@ groups:
         when rescheduled to another node.
 
   # ═══════════════════════════════════════════════
-  # 告警 3：StatefulSet Pod 使用 PVC 且卡在 ContainerCreating
+  # 告警 3：StatefulSet Pod 使用 PVC 且卡在 Pending
   # 不依賴 VolumeAttachment metrics
   # ═══════════════════════════════════════════════
   - alert: StatefulSetPodPendingWithPVC
     expr: |
       (
-        (
-          min_over_time(
-            kube_pod_container_status_waiting_reason{reason="ContainerCreating"}[5m]
-          ) == 1
-        )
+        (min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1)
           * on(namespace, pod) group_left(created_by_name)
           kube_pod_info{created_by_kind="StatefulSet"}
       )
@@ -428,11 +439,23 @@ groups:
     labels:
       severity: critical
     annotations:
-      summary: "StatefulSet pod with PVC stuck in ContainerCreating"
+      summary: "StatefulSet pod with PVC stuck in Pending"
       description: |
         Pod {{ $labels.namespace }}/{{ $labels.pod }} (StatefulSet: {{ $labels.created_by_name }})
-        is stuck in ContainerCreating and uses a PVC.
+        has been Pending for more than 5 minutes and uses a PVC.
         This is likely a Multi-Attach error caused by a node failure.
+        Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
+```
+
+備註：如果環境有特定 StorageClass，可加篩選：
+```yaml
+      # 只監控 NetApp SAN（範例）
+      and on(namespace, pod)
+      (
+        kube_pod_spec_volumes_persistentvolumeclaims_info
+          * on(namespace, persistentvolumeclaim) group_left()
+          kube_persistentvolumeclaim_info{storageclass=~"netapp-san.*"}
+      )
 ```
 
 ---
@@ -441,7 +464,7 @@ groups:
 
 | 方法 | 可行性 | 精確度 | 前置需求 | 適用場景 |
 |------|--------|--------|----------|----------|
-| 症狀偵測（ContainerCreating > 5min） | 高 | 中 | kube-state-metrics | 通用告警，涵蓋多種原因 |
+| 症狀偵測（Pending > 5min） | 高 | 中 | kube-state-metrics | 通用告警，涵蓋 Init:0/N、ContainerCreating 等 |
 | 前兆偵測（NotReady + StatefulSet） | 高 | 中 | kube-state-metrics | 提前警告，但可能誤報 |
 | Join 到 VolumeAttachment（bridge）— 方案 A | 高 | 高 | VA metrics 可靠 | 精確偵測 volume 卡住 |
 | StatefulSet + PVC 偵測 — 方案 B | 高 | 中高 | 僅 Pod/PVC metrics | VA metrics 不可靠時的替代 |
@@ -460,7 +483,7 @@ groups:
 
 ```
 方案 A（VA metrics 可靠）：
-  Layer 1（症狀）：PodStuckContainerCreating
+  Layer 1（症狀）：PodStuckPending
     └── 最簡單，覆蓋面廣，5 分鐘內告警
   Layer 2（前兆）：NodeNotReadyWithStatefulSet
     └── Node 一 NotReady 就告警，讓 on-call 提前準備
@@ -468,7 +491,7 @@ groups:
     └── 精確定位哪個 volume 卡住，需要 bridge metric 存在
 
 方案 B（VA metrics 不可靠）：
-  Layer 1（症狀）：PodStuckContainerCreating
+  Layer 1（症狀）：PodStuckPending
     └── 同上
   Layer 2（前兆）：NodeNotReadyWithStatefulSet
     └── 同上
@@ -507,7 +530,7 @@ kubectl --context=kind-mdb -n monitoring get deploy kube-state-metrics \
 本文用到的指標都是「狀態型」（gauge）：
 ├── kube_node_status_condition = 0 或 1（即時狀態）
 ├── kube_volumeattachment_status_attached = 0 或 1（即時狀態）
-└── kube_pod_container_status_waiting_reason = 0 或 1（即時狀態）
+└── kube_pod_status_phase = 0 或 1（即時狀態）
 
 不需要 rate()，直接比較值即可。
 這和之前的 mysql_perf_schema_* metrics（counter，需要 rate()）不同。
