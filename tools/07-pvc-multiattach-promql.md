@@ -427,11 +427,16 @@ groups:
   # 不依賴 VolumeAttachment metrics
   # ═══════════════════════════════════════════════
   - alert: StatefulSetPodPendingWithPVC
+    # ⚠ kube_pod_info 用 max by() 去重，避免 pod 重建時 stale series 導致 many-to-many
     expr: |
       (
         (min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1)
           * on(namespace, pod) group_left(created_by_name)
-          kube_pod_info{created_by_kind="StatefulSet"}
+          (
+            max by (namespace, pod, created_by_name) (
+              kube_pod_info{created_by_kind="StatefulSet"}
+            )
+          )
       )
         and on(namespace, pod)
         kube_pod_spec_volumes_persistentvolumeclaims_info
