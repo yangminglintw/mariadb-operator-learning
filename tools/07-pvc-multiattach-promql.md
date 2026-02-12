@@ -199,6 +199,37 @@ kube_volumeattachment_status_attached               ← 得到 node label
 kube_node_status_condition                          ← 判斷 NotReady
 ```
 
+**新的偵測路徑（不依賴 Node 狀態 — 推薦）：**
+
+```
+kube_volumeattachment_spec_source_persistentvolume
+  │ join on (volumeattachment)
+  ▼
+kube_volumeattachment_status_attached == 1
+  │ count by (volumename) > 1
+  ▼
+Multi-Attach 確認！  ← 不需要 Node 狀態，直接從 VA 計數判斷
+```
+
+### 另一個解法：label_replace 重新命名 Label
+
+除了 bridge metric，也可以用 `label_replace` 把 label 重新命名以便 join。
+
+```
+語法：
+  label_replace(向量, "新label名", "$1", "來源label名", "(.*)")
+
+實例：把 volumename 複製為 persistentvolume
+  label_replace(
+    kube_volumeattachment_spec_source_persistentvolume,
+    "persistentvolume", "$1", "volumename", "(.*)"
+  )
+
+和 Bridge Metric 的差異：
+  Bridge Metric → 靠指標本身同時擁有兩邊的 label
+  label_replace  → 靠重新命名 label 讓兩邊可以 join
+```
+
 ---
 
 ## 實用 PromQL 查詢
@@ -233,6 +264,13 @@ min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
     kube_node_status_condition{condition="Ready", status="unknown"} == 1
   )
 ```
+
+> ⚠ 此查詢依賴 `kube_node_status_condition`，可能不可靠：
+> - kubelet 失聯時 series 可能消失或 stale
+> - Node 短暫 flapping 造成誤報
+> - 未涵蓋所有 Multi-Attach 情境（如 force drain 時 Node 可能是 Ready）
+>
+> 更可靠的替代：直接偵測 VA count > 1，見下方「Step 4」及方案 A 告警。
 
 ### 完整 Join：PVC → PV → VolumeAttachment → Node
 
@@ -275,6 +313,18 @@ min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
       or
     kube_node_status_condition{condition="Ready", status="unknown"} == 1
   )
+```
+
+**Step 4：直接 Multi-Attach 偵測（推薦 — 不依賴 Node 狀態）**
+
+```promql
+# 直接 Multi-Attach 偵測：每個 PV 的 active VA 數量 > 1
+# 這就是 Multi-Attach 的定義 — 不需要繞道 Node 狀態
+count by (volumename) (
+  kube_volumeattachment_spec_source_persistentvolume
+    * on(volumeattachment) group_left()
+    (kube_volumeattachment_status_attached == 1)
+) > 1
 ```
 
 ### PromQL Join 語法說明
@@ -320,56 +370,99 @@ groups:
         resource quota, node affinity.
 
   # ═══════════════════════════════════════════════
-  # 告警 2：前兆偵測（Node NotReady + StatefulSet）
+  # 告警 2：直接 Multi-Attach 偵測（VA count > 1）
+  # 不依賴 kube_node_status_condition，更可靠
   # ═══════════════════════════════════════════════
-  - alert: NodeNotReadyWithStatefulSet
+  - alert: PVMultipleVolumeAttachments
     expr: |
-      count by (node) (
-        (kube_pod_info{created_by_kind="StatefulSet"})
-          * on(node) group_left()
-          (
-            kube_node_status_condition{condition="Ready", status="false"} == 1
-              or
-            kube_node_status_condition{condition="Ready", status="unknown"} == 1
-          )
-      ) > 0
+      count by (volumename) (
+        kube_volumeattachment_spec_source_persistentvolume
+          * on(volumeattachment) group_left()
+          (kube_volumeattachment_status_attached == 1)
+      ) > 1
     for: 1m
     labels:
       severity: critical
     annotations:
-      summary: "NotReady node has StatefulSet pods"
+      summary: "PV has multiple active VolumeAttachments (Multi-Attach)"
       description: |
-        Node {{ $labels.node }} is NotReady and has StatefulSet pods.
-        These pods use RWO PVC and may encounter Multi-Attach errors
-        when rescheduled to another node.
+        PV {{ $labels.volumename }} has {{ $value }} active VolumeAttachments.
+        This IS a Multi-Attach situation — a pod using this RWO volume on
+        another node will be stuck.
+        Check: kubectl get volumeattachment -o wide | grep {{ $labels.volumename }}
 
   # ═══════════════════════════════════════════════
-  # 告警 3：精確偵測（需要 bridge metric）
-  # ⚠ VA metrics 可能在 Node 故障期間消失，導致此告警不觸發
+  # 告警 3：組合偵測 — Pending Pod + PVC 的 PV 有多個 VA
+  # 結合症狀（Pod Pending）和根因（Multi-Attach）
   # ═══════════════════════════════════════════════
-  - alert: VolumeStuckOnNotReadyNode
+  - alert: PendingPodWithMultiAttachedPVC
+    # ⚠ kube_pod_info 用 max by() 去重，避免 stale series many-to-many
     expr: |
       (
-        (kube_volumeattachment_status_attached == 1)
-          * on(volumeattachment) group_left(volumename)
-          kube_volumeattachment_spec_source_persistentvolume
+        kube_pod_spec_volumes_persistentvolumeclaims_info
+          * on(namespace, pod) group_left(phase)
+          (kube_pod_status_phase{phase="Pending"} == 1)
+          * on(namespace, pod) group_left(created_by_name)
+          (
+            max by (namespace, pod, created_by_name) (
+              kube_pod_info{created_by_kind="StatefulSet"}
+            )
+          )
+          * on(namespace, persistentvolumeclaim) group_left(volumename)
+          kube_persistentvolumeclaim_info
       )
-        * on(node) group_left()
+        and on(volumename)
         (
-          kube_node_status_condition{condition="Ready", status="false"} == 1
-            or
-          kube_node_status_condition{condition="Ready", status="unknown"} == 1
+          count by (volumename) (
+            kube_volumeattachment_spec_source_persistentvolume
+              * on(volumeattachment) group_left()
+              (kube_volumeattachment_status_attached == 1)
+          ) > 1
         )
     for: 2m
     labels:
       severity: critical
     annotations:
-      summary: "Volume attached to NotReady node"
+      summary: "Pending StatefulSet pod's PVC has Multi-Attach"
       description: |
-        VolumeAttachment {{ $labels.volumeattachment }} (PV: {{ $labels.volumename }})
-        is still attached to node {{ $labels.node }} which is NotReady.
-        Any pod using this volume on another node will get Multi-Attach error.
+        Pod {{ $labels.namespace }}/{{ $labels.pod }}
+        (StatefulSet: {{ $labels.created_by_name }})
+        is Pending and its PVC {{ $labels.persistentvolumeclaim }}
+        (PV: {{ $labels.volumename }}) has multiple active VolumeAttachments.
+        Check: kubectl describe pod {{ $labels.pod }} -n {{ $labels.namespace }}
 ```
+
+**告警 3 Join 鏈解說：**
+
+```
+kube_pod_spec_volumes_persistentvolumeclaims_info  ← 起點（每 pod-PVC 一筆）
+  │ * on(namespace, pod) → kube_pod_status_phase{Pending}
+  │ * on(namespace, pod) → kube_pod_info{StatefulSet}
+  │ * on(namespace, persistentvolumeclaim) → kube_persistentvolumeclaim_info  → 得到 volumename
+  ▼
+and on(volumename) → count VA per volumename > 1  ← Multi-Attach 確認
+```
+
+### 環境特定調整（選用）
+
+#### StorageClass 過濾
+
+只監控特定 StorageClass（如 NetApp SAN）：
+
+```promql
+# 在告警 3 中替換 kube_persistentvolumeclaim_info 加上篩選
+* on(namespace, persistentvolumeclaim) group_left(volumename)
+kube_persistentvolumeclaim_info{storageclass=~"netapp-san.*"}
+```
+
+#### iSCSI Metadata（CSI driver 特定）
+
+⚠ `kube_volumeattachment_status_attachment_metadata` 不是標準 kube-state-metrics 指標。
+是否存在取決於 CSI driver 和 kube-state-metrics 配置。
+
+#### Pod 建立時間
+
+加入 `kube_pod_created * 1000` 可在 Grafana 中顯示 pod 卡住的起始時間。
 
 ### 方案 B：without VolumeAttachment（VA metrics 不可靠的環境）
 
@@ -399,7 +492,8 @@ groups:
         resource quota, node affinity.
 
   # ═══════════════════════════════════════════════
-  # 告警 2：前兆偵測（同方案 A）
+  # 告警 2：前兆偵測（次優方案 — VA metrics 不可用時的替代）
+  # ⚠ kube_node_status_condition 的局限性見「限制與注意事項」段落
   # ═══════════════════════════════════════════════
   - alert: NodeNotReadyWithStatefulSet
     expr: |
@@ -470,8 +564,8 @@ groups:
 | 方法 | 可行性 | 精確度 | 前置需求 | 適用場景 |
 |------|--------|--------|----------|----------|
 | 症狀偵測（Pending > 5min） | 高 | 中 | kube-state-metrics | 通用告警，涵蓋 Init:0/N、ContainerCreating 等 |
-| 前兆偵測（NotReady + StatefulSet） | 高 | 中 | kube-state-metrics | 提前警告，但可能誤報 |
-| Join 到 VolumeAttachment（bridge）— 方案 A | 高 | 高 | VA metrics 可靠 | 精確偵測 volume 卡住 |
+| 前兆偵測（NotReady + StatefulSet） | 高 | 中 | kube-state-metrics | 提前警告，但可能誤報（見限制說明） |
+| 直接 VA 計數（VA count > 1）— 方案 A | 高 | 最高 | VA metrics 可靠 | 直接偵測 Multi-Attach，不依賴 Node 狀態 |
 | StatefulSet + PVC 偵測 — 方案 B | 高 | 中高 | 僅 Pod/PVC metrics | VA metrics 不可靠時的替代 |
 | Event exporter | 最精確 | 高 | 需額外部署 event-exporter | 捕捉 `FailedAttachVolume` 事件 |
 
@@ -487,19 +581,19 @@ groups:
 ### 建議組合
 
 ```
-方案 A（VA metrics 可靠）：
+方案 A（VA metrics 可靠）— 推薦：
   Layer 1（症狀）：PodStuckPending
     └── 最簡單，覆蓋面廣，5 分鐘內告警
-  Layer 2（前兆）：NodeNotReadyWithStatefulSet
-    └── Node 一 NotReady 就告警，讓 on-call 提前準備
-  Layer 3（精確）：VolumeStuckOnNotReadyNode
-    └── 精確定位哪個 volume 卡住，需要 bridge metric 存在
+  Layer 2（根因）：PVMultipleVolumeAttachments
+    └── 直接偵測 Multi-Attach，不依賴 Node 狀態
+  Layer 3（定位）：PendingPodWithMultiAttachedPVC
+    └── 精確定位受影響的 Pod + PVC + PV
 
 方案 B（VA metrics 不可靠）：
   Layer 1（症狀）：PodStuckPending
     └── 同上
   Layer 2（前兆）：NodeNotReadyWithStatefulSet
-    └── 同上
+    └── 次優方案，但無 VA metrics 時是唯一前兆偵測手段
   Layer 3（關聯）：StatefulSetPodPendingWithPVC
     └── 不依賴 VA，用 Pod + PVC + StatefulSet 關聯偵測
 ```
@@ -583,6 +677,25 @@ Node 故障時，kube-state-metrics 可能無法 scrape 到 VolumeAttachment met
   → 只要故障 series 存在就會觸發
 
 永遠用正向斷言偵測異常狀態。
+```
+
+### 為什麼 kube_node_status_condition 不適合作為主要偵測手段
+
+```
+1. Node NotReady ≠ Multi-Attach（語義間接）
+   → Node 可以因為很多原因 NotReady，不一定有 volume 問題
+   → Multi-Attach 也可能發生在 Node 仍然 Ready 的情況（如 force drain）
+
+2. kubelet 失聯時 series 可能消失或 stale
+   → kube_node_status_condition 依賴 kube-state-metrics 能 scrape 到 Node 狀態
+   → 某些故障情境下 series 可能短暫 flapping 造成誤報
+
+3. force drain 時 Node 可能仍 Ready，但 VA 未正確清理
+   → 此時 kube_node_status_condition 不會觸發，但 Multi-Attach 已經發生
+
+4. VA count > 1 per PV 才是 Multi-Attach 的定義
+   → count by (volumename) (VA attached) > 1 直接表達語義
+   → 如果 VA metrics 可用，應優先使用直接偵測（方案 A）
 ```
 
 ### kubelet 相關參數
