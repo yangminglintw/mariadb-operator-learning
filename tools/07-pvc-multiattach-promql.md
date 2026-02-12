@@ -97,7 +97,7 @@ kubectl --context=kind-mdb get volumeattachment \
 | `kube_pod_container_status_waiting_reason` | pod, namespace, container, reason | 偵測 ContainerCreating（⚠ 不涵蓋 init container 卡住的情況） |
 | `kube_pod_status_phase` | pod, namespace, phase | Pod 狀態（Pending/Running） |
 | `kube_pod_spec_volumes_persistentvolumeclaims_info` | pod, namespace, persistentvolumeclaim | Pod → PVC 對應 |
-| `kube_persistentvolumeclaim_info` | persistentvolumeclaim, namespace, storageclass, volumename | PVC → PV 對應 |
+| `kube_persistentvolumeclaim_info` | persistentvolumeclaim, namespace, storageclass, volumename | PVC → PV 對應（⚠ binding 時可能有 stale series） |
 | `kube_persistentvolumeclaim_status_phase` | persistentvolumeclaim, namespace, phase | PVC 狀態（Bound/Pending） |
 | `kube_volumeattachment_spec_source_persistentvolume` | volumeattachment, volumename | **Bridge metric**：PV → VA |
 | `kube_volumeattachment_status_attached` | volumeattachment, node | VA 掛載狀態（0/1） |
@@ -298,6 +298,10 @@ min_over_time(kube_pod_status_phase{phase="Pending"}[5m]) == 1
   kube_persistentvolumeclaim_info
 ```
 
+> ⚠ 在告警規則中使用 `kube_persistentvolumeclaim_info` 做 `group_left` join 時，
+> 應用 `max by()` 去重，避免 PVC binding 過程中的 stale series 造成 many-to-many。
+> 見方案 A 告警 3 的寫法。
+
 **Step 3：Volume 掛在 NotReady node 上（Multi-Attach 風險偵測）**
 
 ```promql
@@ -396,7 +400,8 @@ groups:
   # 結合症狀（Pod Pending）和根因（Multi-Attach）
   # ═══════════════════════════════════════════════
   - alert: PendingPodWithMultiAttachedPVC
-    # ⚠ kube_pod_info 用 max by() 去重，避免 stale series many-to-many
+    # ⚠ kube_pod_info 和 kube_persistentvolumeclaim_info 都用 max by() 去重
+    # 避免 pod 重建或 PVC binding 時 stale series 導致 many-to-many
     expr: |
       (
         kube_pod_spec_volumes_persistentvolumeclaims_info
@@ -409,7 +414,11 @@ groups:
             )
           )
           * on(namespace, persistentvolumeclaim) group_left(volumename)
-          kube_persistentvolumeclaim_info
+          (
+            max by (namespace, persistentvolumeclaim, volumename) (
+              kube_persistentvolumeclaim_info{volumename!=""}
+            )
+          )
       )
         and on(volumename)
         (
@@ -438,7 +447,7 @@ groups:
 kube_pod_spec_volumes_persistentvolumeclaims_info  ← 起點（每 pod-PVC 一筆）
   │ * on(namespace, pod) → kube_pod_status_phase{Pending}
   │ * on(namespace, pod) → kube_pod_info{StatefulSet}
-  │ * on(namespace, persistentvolumeclaim) → kube_persistentvolumeclaim_info  → 得到 volumename
+  │ * on(namespace, persistentvolumeclaim) → max by() kube_persistentvolumeclaim_info  → 得到 volumename
   ▼
 and on(volumename) → count VA per volumename > 1  ← Multi-Attach 確認
 ```
