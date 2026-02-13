@@ -568,6 +568,140 @@ groups:
 
 ---
 
+## 實際案例與驗證
+
+### 案例一：Node NotReady → Multi-Attach（最常見情境）
+
+```
+時間線：
+
+T+0     Node A 變成 NotReady（kubelet 失聯）
+          Pod mariadb-chaos-1 在 Node A：Terminating
+          VA-1 仍在（attached=true）—— kubelet 死了，沒人能 detach
+                                                                ┌──────────┐
+T+40s   Node controller 標記 pod 為 Terminating                 │ VA 數量   │
+          （node-monitor-grace-period = 40s）                    │          │
+                                                                │   1 個    │
+T+5m    StatefulSet controller 在 Node B 建立新 pod             │          │
+          AD controller 建立 VA-2（Node B, attached=true）       │   2 個 ← │ Multi-Attach!
+                                                                │          │
+T+5m    新 pod 卡在 Pending（Init:0/N）                         │   2 個    │
+          kubectl describe pod 可看到：                          │          │
+          "Multi-Attach error for volume pvc-xxx"               │          │
+                                                                │          │
+T+11m   AD controller force detach VA-1（刪除舊 VA）            │   1 個    │
+          Volume 掛載到 Node B，pod 正常啟動                     └──────────┘
+```
+
+**自動恢復條件**：Node 完全死掉 → kubelet 停止更新 → AD controller 能成功 force detach。
+
+**不會自動恢復的情況**：
+
+| 情況 | 原因 | 處理 |
+|------|------|------|
+| 舊 Node 的 kubelet 還活著但卡住 | kubelet 持續更新 VA 狀態，AD controller 無法 force detach | drain 或 delete Node |
+| CSI driver 的 Detach RPC 掛住 | driver 不回應，VA 刪不掉 | 排查 CSI driver |
+| VA 物件孤立（orphaned） | 舊 Node 已刪除但 VA 沒被 GC | 手動刪除 VA |
+
+### 案例二：Multi-Attach + ImagePullBackOff（兩個獨立問題）
+
+```
+觀察到的現象：
+  kubectl get pods:
+    mariadb-chaos-1   0/1   Init:ImagePullBackOff   0   8m
+
+  kubectl describe pod：同時出現兩種 event：
+    1. "Multi-Attach error for volume pvc-xxx"  ← volume 問題
+    2. "Failed to pull image xxx"               ← image 問題
+```
+
+**關鍵理解**：這是兩個**獨立問題**碰巧同時發生，不是因果關係。
+
+```
+時間線：
+
+T+0     Node A 故障 → pod 遷移到 Node B
+
+T+5m    AD controller 建立 VA-2（Node B）
+          → VA-1（Node A）還沒清掉
+          → 兩個 VA 同時存在 → Multi-Attach     ← 問題 1
+
+T+5m    kubelet（Node B）嘗試啟動 init container
+          → 拉 image 失敗 → ImagePullBackOff     ← 問題 2（獨立）
+
+T+11m   Force detach 成功，VA-1 刪除
+          → Multi-Attach 解除                     ← 問題 1 解決
+
+T+11m+  但 pod 仍卡在 ImagePullBackOff            ← 問題 2 未解決
+          → 需要另外處理 image 問題
+```
+
+**為什麼 VA 在 image pull 之前就建立了？**
+
+```
+Volume 掛載流程先於 container 啟動：
+  schedule → attach (VA 建立) → mount → init containers → main containers
+                                              ↑
+                                         image pull 在這裡
+所以即使 image 有問題，VA 已經建立了。
+```
+
+### 查詢驗證方法
+
+在實際環境中驗證 PromQL 查詢是否正常運作：
+
+**方法 1：去掉 `> 1` 看底層 join**
+
+```promql
+# 正常時每個 PV 的 VA count 應為 1
+count by (volumename) (
+  kube_volumeattachment_spec_source_persistentvolume
+    * on(volumeattachment) group_left()
+    (kube_volumeattachment_status_attached == 1)
+)
+
+# 結果解讀：
+#   {volumename="pvc-xxx"} 1   → 正常（1 個 VA）
+#   {volumename="pvc-yyy"} 1   → 正常
+#   empty                       → 環境沒有 VA（如 local-path provisioner）
+```
+
+**方法 2：kubectl 交叉確認**
+
+```bash
+# 看所有 VA 的 PV 和 Node 對應
+kubectl --context=kind-mdb get volumeattachment \
+  -o custom-columns='NAME:.metadata.name,PV:.spec.source.persistentVolumeName,NODE:.spec.nodeName,ATTACHED:.status.attached'
+
+# 結果應和 PromQL 的 count by (volumename) 一致
+```
+
+**方法 3：確認環境前置條件**
+
+```bash
+# 確認 StorageClass 是否使用 CSI（只有 CSI 才有 VA）
+kubectl --context=kind-mdb get storageclass -o wide
+# PROVISIONER 是 *.csi.* → 有 VA
+# PROVISIONER 是 rancher.io/local-path → 沒有 VA（查詢必定 empty）
+
+# 確認 kube-state-metrics 有啟用 VA metrics
+# 在 Prometheus UI 查詢：kube_volumeattachment_spec_source_persistentvolume
+# 有結果 → 可以用完整 join chain
+```
+
+**Kind 環境（local-path）的預期行為**：
+
+```
+Kind 使用 standard StorageClass（local-path provisioner），不是 CSI driver：
+  → 不會建立 VolumeAttachment 物件
+  → 所有 VA 相關的 PromQL 查詢回傳 empty
+  → 這是正常行為，不是查詢有問題
+
+查詢適用於生產環境的遠端儲存（SAN/iSCSI/EBS/Ceph）。
+```
+
+---
+
 ## 監控策略比較
 
 | 方法 | 可行性 | 精確度 | 前置需求 | 適用場景 |
