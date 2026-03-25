@@ -661,10 +661,121 @@ SELECT @@performance_schema;
 
 ---
 
-## 十一、診斷流程總結
+## 十一、Prometheus Metrics 與 SQL 診斷的對接
+
+### Prometheus 只告訴你「有問題」，不告訴你「哪條 SQL」
+
+mysqld_exporter 匯出的 lock 相關 metrics 來自 `SHOW GLOBAL STATUS`，只有**計數器和統計值**，沒有 SQL 內容：
+
+```
+Prometheus metric                                     來源（MariaDB GLOBAL STATUS）
+─────────────────────────────────────────────────────────────────────────────────
+mysql_global_status_innodb_row_lock_current_waits  →  Innodb_row_lock_current_waits（當前等待數）
+mysql_global_status_innodb_row_lock_time_total      →  Innodb_row_lock_time（累計等待時間 ms）
+mysql_global_status_innodb_row_lock_time_avg        →  Innodb_row_lock_time_avg（平均等待時間 ms）
+mysql_global_status_innodb_row_lock_time_max        →  Innodb_row_lock_time_max（最大等待時間 ms）
+mysql_global_status_innodb_row_lock_waits_total     →  Innodb_row_lock_waits（累計等待次數）
+```
+
+### 從 Prometheus Alert 到找出 SQL 的完整流程
+
+```
+Prometheus alert: mysql_global_status_innodb_row_lock_current_waits > 0
+    │
+    │  ← 這只告訴你「現在有 N 個 transaction 在等 row lock」
+    │     不告訴你是哪個 table、哪條 SQL、誰 block 誰
+    │
+    ▼
+進 MariaDB 查（第三節 Query 1）：
+    SELECT ... FROM INNODB_LOCK_WAITS w
+    JOIN INNODB_TRX b ... JOIN INNODB_TRX r ... JOIN INNODB_LOCKS l ...
+    │
+    ▼
+得到完整資訊：
+    - waiting_query:  等待中的 SQL
+    - blocking_query: 持有 lock 的 SQL（可能 NULL → 第五節）
+    - locked_table:   被鎖的表
+    - lock_data:      被鎖的行 PK
+    - blocking_age:   blocker 已跑多久
+```
+
+### 實際操作：Alert 觸發時怎麼做
+
+**Step 1**：確認哪個 pod 有 lock wait（如果有多個 instance）
+
+```bash
+# 如果 Prometheus alert 有 instance label，直接知道是哪個 pod
+# 否則用腳本掃所有 pod：
+bash check_row_locks.sh kind-mdb default mariadb-chaos
+```
+
+**Step 2**：在有 lock wait 的 pod 上執行診斷 SQL
+
+```bash
+MYSQL_PWD=$(kubectl --context=kind-mdb -n default \
+  exec mariadb-chaos-0 -c mariadb -- printenv MARIADB_ROOT_PASSWORD)
+
+# 查看當前 lock wait 詳情（第三節 Query 1）
+kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
+  mariadb -u root -p"${MYSQL_PWD}" -e "
+    SELECT
+      r.trx_id              AS waiting_trx_id,
+      r.trx_mysql_thread_id AS waiting_thread,
+      r.trx_query           AS waiting_query,
+      b.trx_id              AS blocking_trx_id,
+      b.trx_mysql_thread_id AS blocking_thread,
+      b.trx_query           AS blocking_query,
+      TIMESTAMPDIFF(SECOND, b.trx_started, NOW()) AS blocking_age_sec,
+      l.lock_table          AS locked_table,
+      l.lock_mode           AS lock_mode,
+      l.lock_data           AS lock_data
+    FROM information_schema.INNODB_LOCK_WAITS w
+    JOIN information_schema.INNODB_TRX b ON b.trx_id = w.blocking_trx_id
+    JOIN information_schema.INNODB_TRX r ON r.trx_id = w.requesting_trx_id
+    JOIN information_schema.INNODB_LOCKS l ON l.lock_id = w.requested_lock_id\G"
+```
+
+**Step 3**：如果 `blocking_query` 為 NULL → 第五節追溯方法
+
+**Step 4**：如果 alert 已 resolved（lock 已結束）→ 第十節事後追溯
+
+### 常用 PromQL 告警規則參考
+
+```yaml
+# 當前有 row lock wait
+- alert: MariaDBRowLockWait
+  expr: mysql_global_status_innodb_row_lock_current_waits > 0
+  for: 30s
+  labels:
+    severity: warning
+  annotations:
+    summary: "Row lock wait detected on {{ $labels.instance }}"
+    runbook: "執行 check_row_locks.sh 或第三節 Query 1 找出 blocking SQL"
+
+# lock wait 次數快速增長（5 分鐘內增加 > 10 次）
+- alert: MariaDBRowLockWaitSpike
+  expr: increase(mysql_global_status_innodb_row_lock_waits_total[5m]) > 10
+  labels:
+    severity: warning
+  annotations:
+    summary: "Row lock wait spike on {{ $labels.instance }}"
+
+# 平均 lock wait 時間過高
+- alert: MariaDBRowLockTimeHigh
+  expr: mysql_global_status_innodb_row_lock_time_avg > 5000
+  labels:
+    severity: critical
+  annotations:
+    summary: "Average row lock wait > 5s on {{ $labels.instance }}"
+```
+
+---
+
+## 十二、診斷流程總結
 
 ```
 發現問題
+  ├─ Prometheus: mysql_global_status_innodb_row_lock_current_waits > 0
   ├─ Slow query log Lock_time > 0.1s（見 08-how-to-read-slow-query-output.md）
   ├─ 應用端收到 ERROR 1205（lock wait timeout）
   └─ 應用端收到 ERROR 1213（deadlock）
