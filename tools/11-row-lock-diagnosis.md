@@ -489,7 +489,116 @@ SELECT * FROM information_schema.METADATA_LOCK_INFO;
 
 ---
 
-## 十、診斷流程總結
+## 十、事後追溯（2-3 小時前的 Row Lock）
+
+`INNODB_LOCK_WAITS` 只記錄**當下正在發生**的 lock wait，lock 結束後資料就消失了。
+要追溯幾小時前的 row lock，需要靠以下來源：
+
+### 現實：MariaDB 沒有 lock 歷史表
+
+```
+即時診斷（lock 正在發生）         事後追溯（lock 已結束）
+  INNODB_LOCK_WAITS ✓               INNODB_LOCK_WAITS ✗ （資料已消失）
+  INNODB_TRX ✓                      INNODB_TRX ✗
+  SHOW ENGINE INNODB STATUS ✓       需要靠其他來源 ↓
+```
+
+### 方法 1：Slow Query Log 的 Lock_time（最實用）
+
+每筆 slow query 都記錄了 `Lock_time` — 等待 row lock 的時間。如果一個查詢因為 lock wait 而變慢，
+它會出現在 slow log 中，且 `Lock_time` > 0。
+
+```bash
+# 用 show_slow_queries.sh 看最近 1 天的慢查詢（見 05-slow-query-log-scripts.md）
+bash show_slow_queries.sh kind-mdb default mariadb-chaos --days 1
+
+# 輸出中找 Lock_time 高的記錄：
+# [3] 2026-03-25 14:23:45 | Query_time: 5.234s | Lock: 5.001s | Rows exam/sent: 1/0
+#     Schema: myapp | User: app_user
+#     UPDATE orders SET status='cancel' WHERE id=5
+#                                          ^^^^^^^^
+#                                          Lock: 5.001s 表示這條 SQL 等了 5 秒才拿到 lock
+```
+
+**限制**：
+- 只有 `Query_time` > `long_query_time`（通常 1s）的查詢才會記錄
+- 如果 lock wait 時間短（< 1s），不會出現在 slow log
+- `Lock_time` 記錄的是 **waiting** 方的等待時間，不直接顯示 **blocking** 方是誰
+
+**判讀技巧**：
+- `Lock_time` 接近 `Query_time` → 查詢本身不慢，完全是在等 lock
+- `Lock_time` ≈ 50s（`innodb_lock_wait_timeout` 預設值）→ 等到 timeout 才放棄
+- 同一時間點多筆 SQL 都有高 `Lock_time` → 同一個 blocker 卡住多個 transaction
+
+### 方法 2：Performance Schema Digest 統計
+
+`events_statements_summary_by_digest` 累積了每種 SQL pattern 的 lock 等待時間。
+雖然不能精確定位「2 小時前」，但可以看出**哪些 SQL pattern 經常受 lock 影響**：
+
+```sql
+SELECT
+  SCHEMA_NAME,
+  DIGEST_TEXT,
+  COUNT_STAR AS exec_count,
+  ROUND(SUM_LOCK_TIME / 1000000, 3) AS total_lock_time_sec,
+  ROUND(SUM_LOCK_TIME / COUNT_STAR / 1000000, 3) AS avg_lock_time_sec,
+  ROUND(SUM_TIMER_WAIT / 1000000000, 3) AS total_time_sec
+FROM performance_schema.events_statements_summary_by_digest
+WHERE SUM_LOCK_TIME > 0
+ORDER BY SUM_LOCK_TIME DESC
+LIMIT 10\G
+```
+
+> **注意**：`SUM_LOCK_TIME` 是 microseconds（百萬分之一秒），需除以 1,000,000 轉成秒。
+> 這是自 server 啟動（或上次 `TRUNCATE TABLE`）以來的**累積值**。
+
+**進階**：如果想要定期快照來比較，可以先記錄基線，過一段時間後再查，做差值分析：
+
+```sql
+-- 重置統計（小心：會清除所有 digest 統計）
+TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;
+
+-- 等待一段時間後再查，就能看到這段時間內的 lock 統計
+```
+
+### 方法 3：Error Log 中的 Deadlock 記錄
+
+如果之前已開啟 `innodb_print_all_deadlocks = ON`（見第八節），所有 deadlock 都會寫入 error log：
+
+```bash
+# 查看 MariaDB error log 中的 deadlock 記錄
+kubectl --context=kind-mdb -n default logs mariadb-chaos-0 -c mariadb | grep -A 30 "DEADLOCK"
+```
+
+> 僅適用於 deadlock。一般的 lock wait（timeout）不會記錄在 error log 中。
+
+### 方法比較
+
+| 方法 | 能看到什麼 | 限制 | 適用場景 |
+|------|-----------|------|---------|
+| Slow log Lock_time | 哪些 SQL 因 lock 等待而變慢 | 只記錄 > long_query_time 的查詢 | 事後追溯最實用 |
+| PS digest summary | 哪些 SQL pattern 累積最多 lock 時間 | 累積值，無法定位精確時間點 | 找出反覆有 lock 問題的 SQL |
+| Error log deadlock | Deadlock 的完整詳情 | 只有 deadlock，需預先開啟設定 | Deadlock 事後分析 |
+| INNODB_LOCK_WAITS | 完整的 blocker/waiter 資訊 | **只有即時**，lock 結束就消失 | 即時診斷 |
+
+### 建議的事前準備
+
+為了讓事後追溯更有效，建議預先設定：
+
+```sql
+-- 1. 確保 slow log 開啟（MariaDB Operator 通常已設定）
+SELECT @@slow_query_log, @@long_query_time;
+
+-- 2. 開啟 deadlock 記錄
+SET GLOBAL innodb_print_all_deadlocks = ON;
+
+-- 3. 確認 Performance Schema 啟用
+SELECT @@performance_schema;
+```
+
+---
+
+## 十一、診斷流程總結
 
 ```
 發現問題
@@ -512,6 +621,12 @@ SELECT * FROM information_schema.METADATA_LOCK_INFO;
      │    └─ SHOW ENGINE INNODB STATUS 查 LATEST DETECTED DEADLOCK
      │         └─ 優化 SQL 執行順序避免再發生
      │
-     └─ 全部正常
-          └─ Lock 已自行解除，查 slow log Lock_time 做事後分析
+     ├─ 全部正常（lock 已結束）
+     │    └─ 事後追溯 → 第十節
+     │         ├─ Slow log Lock_time 找等 lock 的 SQL
+     │         ├─ PS digest summary 找反覆有 lock 的 SQL pattern
+     │         └─ Error log 找 deadlock 記錄
+     │
+     └─ 預防
+          └─ 確認 slow log ON + innodb_print_all_deadlocks ON
 ```
