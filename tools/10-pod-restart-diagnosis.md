@@ -44,6 +44,10 @@ mariadb-chaos-2   2/2     Running   169 (3d ago)    55d   ← AGE 長 + RESTARTS
 | AGE 長 + RESTARTS 高 | **Container 在同一個 pod 內反覆重啟** | OOM、crash、liveness probe 失敗 |
 | AGE 短 + RESTARTS 高 | Pod 被重建，且重建後又有 container restart | 混合原因（例如 node 問題 + OOM） |
 
+> **注意**：AGE 短 + RESTARTS=0 **不一定代表沒有 container restart 發生過**。
+> 某些 operator 版本在 failover 時會 delete 舊 primary pod，導致 RESTARTS 歷史歸零。
+> 如果同時看到 primary 換了，務必追查根因（見路線 B）。
+
 ### 區分 container restart vs pod recreate
 
 ```bash
@@ -127,11 +131,19 @@ kubectl --context=kind-mdb -n mariadb-operator-system logs "$OPERATOR_POD" --sin
 │
 └─ 路線 B：AGE 短 + RESTARTS=0（pod 被 delete 後重建）
     │
+    │  ⚠️ RESTARTS=0 不一定代表沒有 container restart 發生過！
+    │  某些 operator 版本 failover 時會 delete pod → RESTARTS 歸零
+    │
     ├─ 是否剛修改過 MariaDB CR spec？
     │   └→ 是 → §3.6 Operator rolling update（通常是正常行為）
     │
     ├─ Primary 是否換了？（kubectl get mariadb -o jsonpath='{.status.currentPrimary}'）
     │   └→ 是 → §3.6 Switchover 或 Failover
+    │       │
+    │       └→ ⚠️ 追查根因：為什麼 failover？
+    │           ├─ 查 operator logs：grep failover 原因
+    │           ├─ 查 Max_used_connections 是否接近 max_connections → §3.3
+    │           └─ 查 kubectl logs --previous（如果還有上次的 log）
     │
     ├─ Node 是否有問題？（kubectl describe node → Conditions）
     │   └→ 是 → §3.5 Node drain / eviction / NotReady
@@ -346,6 +358,69 @@ kubectl --context=kind-mdb -n default logs mariadb-chaos-0 -c agent --tail=50
 2. 增加 `max_connections`（預留幾個給 probe 和 operator）
 3. 設定 `initialDelaySeconds` 足夠長，讓 InnoDB recovery 有時間完成
 
+#### max_connections 導致的連鎖 Failover
+
+這是一個常見但難以診斷的場景，因為**根因的證據會被 failover 過程抹掉**。
+
+**連鎖反應流程**：
+
+```
+max_connections 滿（App 連線暴衝）
+    ↓
+agent 無法連線 MariaDB → /liveness 回報失敗
+    ↓
+kubelet 殺掉 mariadb container（RESTARTS=1）
+    ↓
+operator 偵測到 primary NotReady → 觸發 failover
+    ↓
+┌─────────────────────────────────────────────────────────┐
+│  Failover 行為因 operator 版本而異：                      │
+│                                                          │
+│  Community 版：舊 primary 降級為 replica                  │
+│    → pod 保留，RESTARTS=1 可見                           │
+│    → 但有已知 bug #363：exit(0) 可能卡在 Succeeded 狀態  │
+│                                                          │
+│  某些客製版：delete 舊 primary pod → 重建                 │
+│    → AGE 短 + RESTARTS=0（痕跡消失）                     │
+└─────────────────────────────────────────────────────────┘
+    ↓
+最終現象：primary 換了 + 舊 pod AGE 短或角色變了
+根因（max_connections）隱藏在中間
+```
+
+**Operator Failover 行為差異**：
+
+| | Community 版 | 某些客製版 |
+|--|-------------|-----------|
+| 舊 primary pod | 保留，降級為 replica | Delete 後重建 |
+| RESTARTS 歷史 | **保留**（可見 RESTARTS=1） | **歸零**（AGE 短 + RESTARTS=0） |
+| 已知問題 | [#363](https://github.com/mariadb-operator/mariadb-operator/issues/363)：exit(0) 卡 Succeeded | — |
+| 診斷難度 | 較低（有 RESTARTS 證據） | 較高（證據消失） |
+
+**診斷命令**（確認是否 max_connections 造成的）：
+
+```bash
+MYSQL_PWD=$(kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- printenv MARIADB_ROOT_PASSWORD)
+
+# 歷史最高連線數 vs limit
+kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
+  mariadb -u root -p"${MYSQL_PWD}" -e "
+    SELECT @@max_connections AS max_conn,
+           (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS
+            WHERE VARIABLE_NAME = 'Max_used_connections') AS max_used,
+           (SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS
+            WHERE VARIABLE_NAME = 'Connection_errors_max_connections') AS errors_max_conn
+  " 2>/dev/null
+
+# 如果 max_used ≈ max_connections，或 errors_max_conn > 0
+# → max_connections 曾經滿過，很可能是根因
+```
+
+**預防**：
+- `max_connections` 預留至少 5-10 個給 agent probe、operator、monitoring
+- 監控 `Max_used_connections / max_connections` 比率（見 §七 PromQL）
+- App 端使用 connection pool，設定合理的 pool size 上限
+
 ### 3.4 Storage 問題
 
 #### Disk Full
@@ -424,6 +499,19 @@ Failover 相關流程見 [`concepts/10-failover.md`](../concepts/10-failover.md)
 | Rolling update | 修改 MariaDB CR spec → operator 更新 StatefulSet → 逐一重建 pod | exitCode=0，pods 依序重啟 |
 | Switchover | 手動修改 `spec.replication.primary.podIndex` | 涉及 primary 切換，operator logs 有 switchover 記錄 |
 | Failover | Primary pod NotReady → operator 自動選新 primary | 詳見 `concepts/10-failover.md` |
+
+**Failover 後舊 primary 的處理（因 operator 版本而異）**：
+
+| | Community 版 | 某些客製版 |
+|--|-------------|-----------|
+| 舊 primary | 降級為 replica，**pod 保留** | **Delete pod** → StatefulSet 重建 |
+| RESTARTS | 保留（container restart 歷史可見） | 歸零（歷史消失） |
+| AGE | 不變 | 重置（AGE 很短） |
+| 根因追查 | 較容易（有 lastState） | 需查 operator logs 和 `Max_used_connections` |
+
+> Community 版已知問題 [#363](https://github.com/mariadb-operator/mariadb-operator/issues/363)：
+> Liveness probe 失敗後，如果 container 以 `exit(0)` 退出，Pod 會卡在 `Succeeded` 狀態，
+> Kubernetes 不會自動重啟它，導致 failover 無法完成。需手動驅逐 pod。
 
 **診斷命令**：
 
@@ -1016,6 +1104,7 @@ spec:
 |-----------|-------------|--------|
 | AGE 短，剛改過 MariaDB CR spec | Operator rolling update | §3.6：正常行為 |
 | AGE 短，primary 換了（currentPrimary 變了） | Switchover 或 Failover | §3.6 + `concepts/10` |
+| AGE 短，primary 換了，`Max_used_connections` ≈ `max_connections` | **max_connections 連鎖反應** | §3.3（連鎖 Failover 段落） |
 | AGE 短，node 有 MemoryPressure/DiskPressure | Node drain / eviction | §3.5 |
 | AGE 短，operator logs 有 failover 記錄 | 自動 Failover | §3.6 + §五 |
 | Pod 卡在 ContainerCreating，events 有 Multi-Attach | PVC 掛載衝突 | §3.4 + `tools/07` |
