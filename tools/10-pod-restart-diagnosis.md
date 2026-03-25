@@ -74,69 +74,84 @@ kubectl --context=kind-mdb -n mariadb-operator-system logs "$OPERATOR_POD" --sin
   grep -i -E "switchover|failover"
 ```
 
-確認完「發生了什麼」之後，進入下方的診斷流程圖。
+確認完「發生了什麼」之後，根據 RESTARTS 和 AGE 進入對應的診斷路線：
+
+- **RESTARTS > 0** → 流程圖**路線 A**（Container restart）
+- **AGE 短 + RESTARTS=0** → 流程圖**路線 B**（Pod recreate）
+- **兩者都有** → 先走路線 A，再走路線 B
 
 ---
 
 ## 診斷流程圖
 
 ```
-restartCount > 0
+你發現了異常（見 §零 的 5 個入口）
 │
-├─ kubectl describe pod → lastState.terminated
-│   │
-│   ├─ reason=OOMKilled, exitCode=137
-│   │   └→ §3.1：記憶體不足（InnoDB buffer pool、查詢暴衝）
-│   │
-│   ├─ reason=Error, exitCode=1
-│   │   └→ §3.2：MariaDB crash（config 錯誤、InnoDB corruption）
-│   │
-│   ├─ reason=Error, exitCode=137（非 OOMKilled）
-│   │   └→ §3.3 或 §3.5：Liveness probe 失敗 或 node eviction（SIGKILL）
-│   │
-│   ├─ reason=Error, exitCode=139
-│   │   └→ §3.2：SIGSEGV（MariaDB bug 或記憶體損壞）
-│   │
-│   ├─ reason=Error, exitCode=143
-│   │   └→ §4.1：SIGTERM 未正常處理（graceful shutdown 失敗）
-│   │
-│   ├─ reason=Completed, exitCode=0
-│   │   └→ §3.6：正常退出後被重啟（operator rolling update）
-│   │
-│   ├─ reason=Unknown, exitCode=255
-│   │   └→ §3.5：Container runtime 異常、node 重啟、kubelet restart
-│   │
-│   └─ 無 lastState（pod 剛建立或 events 已過期）
-│       └→ 檢查 events → 見下方
+│  先看 kubectl get pods 的 RESTARTS 和 AGE
 │
-├─ kubectl get events --field-selector
+├─ 路線 A：RESTARTS > 0（container 在同一個 pod 內重啟）
 │   │
-│   ├─ "Liveness probe failed"
-│   │   └→ §3.3：Liveness Probe 失敗
+│   ├─ kubectl describe pod → lastState.terminated
+│   │   │
+│   │   ├─ reason=OOMKilled, exitCode=137
+│   │   │   └→ §3.1：記憶體不足（InnoDB buffer pool、查詢暴衝）
+│   │   │
+│   │   ├─ reason=Error, exitCode=1
+│   │   │   └→ §3.2：MariaDB crash（config 錯誤、InnoDB corruption）
+│   │   │
+│   │   ├─ reason=Error, exitCode=137（非 OOMKilled）
+│   │   │   └→ §3.3 或 §3.5：Liveness probe 失敗 或 node eviction（SIGKILL）
+│   │   │
+│   │   ├─ reason=Error, exitCode=139
+│   │   │   └→ §3.2：SIGSEGV（MariaDB bug 或記憶體損壞）
+│   │   │
+│   │   ├─ reason=Error, exitCode=143
+│   │   │   └→ §4.1：SIGTERM 未正常處理（graceful shutdown 失敗）
+│   │   │
+│   │   ├─ reason=Completed, exitCode=0
+│   │   │   └→ §3.6：正常退出後被重啟（operator rolling update）
+│   │   │
+│   │   ├─ reason=Unknown, exitCode=255
+│   │   │   └→ §3.5：Container runtime 異常、node 重啟、kubelet restart
+│   │   │
+│   │   └─ 無 lastState → 檢查 events
 │   │
-│   ├─ "Evicted" / "The node was low on resource"
-│   │   └→ §3.5：Node 資源不足
+│   ├─ kubectl get events --field-selector
+│   │   │
+│   │   ├─ "Liveness probe failed" → §3.3
+│   │   ├─ "Evicted" → §3.5
+│   │   ├─ "Multi-Attach error" → §3.4（參考 tools/07）
+│   │   └─ "Killing" / "Stopping container" → §3.6
 │   │
-│   ├─ "Multi-Attach error for volume"
-│   │   └→ §3.4：Storage 問題（參考 tools/07）
-│   │
-│   └─ "Killing" / "Stopping container"
-│       └→ §3.6：Operator 或使用者觸發的重啟
+│   └─ kubectl logs --previous → §4：MariaDB error log 分析
 │
-└─ kubectl logs --previous
-    └→ §4：MariaDB error log 分析
+└─ 路線 B：AGE 短 + RESTARTS=0（pod 被 delete 後重建）
+    │
+    ├─ 是否剛修改過 MariaDB CR spec？
+    │   └→ 是 → §3.6 Operator rolling update（通常是正常行為）
+    │
+    ├─ Primary 是否換了？（kubectl get mariadb -o jsonpath='{.status.currentPrimary}'）
+    │   └→ 是 → §3.6 Switchover 或 Failover
+    │
+    ├─ Node 是否有問題？（kubectl describe node → Conditions）
+    │   └→ 是 → §3.5 Node drain / eviction / NotReady
+    │
+    ├─ 是否有人手動 delete pod？
+    │   └→ 是 → 正常行為（StatefulSet 會自動重建）
+    │
+    └─ 以上都不是 → 檢查 operator logs（§五）
 ```
 
 ---
 
 ## 一、快速分類（Triage）
 
-### 1.1 檢查重啟次數與最近終止原因
+確認是 **container restart（RESTARTS > 0）** 後，用以下命令查詳細的終止原因和 exit code。
+（如果是 pod recreate，見流程圖路線 B。）
+
+### 1.1 檢查終止原因與 exit code
 
 ```bash
-# 列出所有 pod 的 RESTARTS 次數
-kubectl --context=kind-mdb -n default get pods -l app.kubernetes.io/instance=mariadb-chaos -o wide
-
 # 取得特定 pod 所有 container 的重啟資訊
 # 注意：mariadb-operator pod 有 2 個 container（agent + mariadb），需要看兩個
 kubectl --context=kind-mdb -n default get pod mariadb-chaos-0 \
@@ -982,15 +997,26 @@ spec:
 
 ## 八、常見場景速查表
 
+### Container Restart（RESTARTS > 0）
+
 | 你看到什麼 | 最可能的原因 | 查什麼 |
 |-----------|-------------|--------|
 | restartCount 持續增加，reason=OOMKilled | 記憶體不足 | §3.1 + 腳本 2 |
 | CrashLoopBackOff，exitCode=1 | MariaDB 無法啟動 | §3.2：`logs --previous` |
-| restartCount=1，exitCode=0，剛改過 CR spec | Operator rolling update | §3.6：正常行為 |
-| restartCount 在 failover 後增加 | Operator failover 重建 | §3.6 + `concepts/10` |
 | exitCode=137，reason=Error（非 OOM），events 有 probe failed | Liveness probe 失敗 | §3.3 |
-| Pod 卡在 ContainerCreating，events 有 Multi-Attach | PVC 掛載衝突 | §3.4 + `tools/07` |
 | exitCode=137，node 有 MemoryPressure | Node eviction | §3.5 |
+| exitCode=255，reason=Unknown | Container runtime 異常、node 重啟 | §3.5 |
 | logs 有 `InnoDB: Database was not shutdown normally` | 上次非正常關閉，正在 recovery | §4.2：通常自動恢復 |
 | replica 的 `SHOW SLAVE STATUS` 有 error | Replication 斷線 | §4.3 + `concepts/11` |
 | `kubectl logs --previous` 是空的 | Events 已過期，log 已輪轉 | §5.1：看 operator logs |
+
+### Pod Recreate（AGE 短 + RESTARTS=0）
+
+| 你看到什麼 | 最可能的原因 | 查什麼 |
+|-----------|-------------|--------|
+| AGE 短，剛改過 MariaDB CR spec | Operator rolling update | §3.6：正常行為 |
+| AGE 短，primary 換了（currentPrimary 變了） | Switchover 或 Failover | §3.6 + `concepts/10` |
+| AGE 短，node 有 MemoryPressure/DiskPressure | Node drain / eviction | §3.5 |
+| AGE 短，operator logs 有 failover 記錄 | 自動 Failover | §3.6 + §五 |
+| Pod 卡在 ContainerCreating，events 有 Multi-Attach | PVC 掛載衝突 | §3.4 + `tools/07` |
+| AGE 短，找不到任何線索 | 可能有人手動 delete pod | §五：查 operator logs 和 audit log |
