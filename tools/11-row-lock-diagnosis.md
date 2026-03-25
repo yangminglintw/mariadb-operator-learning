@@ -533,33 +533,96 @@ bash show_slow_queries.sh kind-mdb default mariadb-chaos --days 1
 ### 方法 2：Performance Schema Digest 統計
 
 `events_statements_summary_by_digest` 累積了每種 SQL pattern 的 lock 等待時間。
-雖然不能精確定位「2 小時前」，但可以看出**哪些 SQL pattern 經常受 lock 影響**：
+
+#### 2a. Digest Summary — 看 SQL pattern 的 lock 統計 + 時間範圍
+
+這張表有 `FIRST_SEEN` 和 `LAST_SEEN` 欄位，可以知道該 SQL pattern **最早和最近一次**的執行時間：
 
 ```sql
 SELECT
   SCHEMA_NAME,
-  DIGEST_TEXT,
+  LEFT(DIGEST_TEXT, 80) AS digest_text,
   COUNT_STAR AS exec_count,
   ROUND(SUM_LOCK_TIME / 1000000, 3) AS total_lock_time_sec,
   ROUND(SUM_LOCK_TIME / COUNT_STAR / 1000000, 3) AS avg_lock_time_sec,
-  ROUND(SUM_TIMER_WAIT / 1000000000, 3) AS total_time_sec
+  FIRST_SEEN,
+  LAST_SEEN
 FROM performance_schema.events_statements_summary_by_digest
 WHERE SUM_LOCK_TIME > 0
 ORDER BY SUM_LOCK_TIME DESC
 LIMIT 10\G
 ```
 
-> **注意**：`SUM_LOCK_TIME` 是 microseconds（百萬分之一秒），需除以 1,000,000 轉成秒。
+**解讀範例**：
+
+```
+digest_text: UPDATE `orders` SET `status` = ? WHERE `id` = ?
+exec_count: 1234
+total_lock_time_sec: 125.500
+avg_lock_time_sec: 0.102
+FIRST_SEEN: 2026-03-20 08:00:00
+LAST_SEEN: 2026-03-25 14:23:45      ← 最近一次執行時間
+```
+
+- `LAST_SEEN` 在 2-3 小時前 → 這個 SQL pattern 那時候有執行
+- `avg_lock_time_sec` > 0.1 → 平均每次執行都有明顯 lock 等待
+- 但 `FIRST_SEEN`/`LAST_SEEN` 只告訴你**最早和最晚**，中間的個別執行時間看不到
+
+> **注意**：`SUM_LOCK_TIME` 是 picoseconds（10^-12 秒），需除以 1,000,000 轉成 microseconds 再除以 1,000,000 轉成秒。
+> 實務上 MariaDB 的精度為 microseconds，所以除以 1,000,000 即可。
 > 這是自 server 啟動（或上次 `TRUNCATE TABLE`）以來的**累積值**。
 
-**進階**：如果想要定期快照來比較，可以先記錄基線，過一段時間後再查，做差值分析：
+#### 2b. History Long — 看個別 SQL 的執行時間（有時間戳）
+
+如果需要**個別 SQL 的精確執行時間**，用 `events_statements_history_long`：
+
+```sql
+SELECT
+  DATE_SUB(NOW(), INTERVAL (
+    SELECT VARIABLE_VALUE FROM information_schema.GLOBAL_STATUS
+    WHERE VARIABLE_NAME = 'UPTIME'
+  ) - TIMER_START / 1000000000000 SECOND) AS approx_time,
+  sql_text,
+  ROUND(LOCK_TIME / 1000000, 3) AS lock_time_sec,
+  ROUND(TIMER_WAIT / 1000000000, 3) AS query_time_ms,
+  ROWS_EXAMINED,
+  ROWS_SENT
+FROM performance_schema.events_statements_history_long
+WHERE LOCK_TIME > 0
+ORDER BY LOCK_TIME DESC
+LIMIT 20\G
+```
+
+> **限制**：`events_statements_history_long` 是 ring buffer，預設保留最近 10,000 條 SQL（所有 thread 共享）。
+> 在高流量下，2-3 小時前的 SQL 很可能已被覆蓋。
+
+查看 buffer 大小：
+
+```sql
+SELECT @@performance_schema_events_statements_history_long_size;
+-- 預設 10000。如果需要更長的歷史，可在 my.cnf 中調大。
+```
+
+#### 2c. 定期快照 — 定位特定時間段的 lock 變化
+
+如果想精確知道某段時間的 lock 狀況，可以用「重置 → 等待 → 查詢」的方式：
 
 ```sql
 -- 重置統計（小心：會清除所有 digest 統計）
 TRUNCATE TABLE performance_schema.events_statements_summary_by_digest;
 
 -- 等待一段時間後再查，就能看到這段時間內的 lock 統計
+-- （此時 FIRST_SEEN/LAST_SEEN 就是這段時間內的範圍）
 ```
+
+#### 時間資訊比較
+
+| 來源 | 有時間戳？ | 精確度 | 保留多久 |
+|------|-----------|--------|---------|
+| `summary_by_digest.FIRST_SEEN` | 有 | 只有最早和最晚 | Server 啟動至今 |
+| `summary_by_digest.LAST_SEEN` | 有 | 只有最早和最晚 | Server 啟動至今 |
+| `history_long.TIMER_START` | 有（需轉換） | 每條 SQL 都有 | Ring buffer，高流量下很快覆蓋 |
+| Slow log `# Time:` | 有 | 每條 SQL 都有 | 直到 log rotation |
 
 ### 方法 3：Error Log 中的 Deadlock 記錄
 
