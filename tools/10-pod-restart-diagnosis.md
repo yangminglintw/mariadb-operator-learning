@@ -3,12 +3,78 @@
 ## 背景
 
 MariaDB pod 在 Kubernetes 中重啟，可能是 OOM、應用 crash、probe 失敗、storage 問題、node 問題，或 operator 主動觸發。
-本指南提供系統性的診斷流程，從「發現 restartCount > 0」開始，逐步定位根因。
+本指南提供系統性的診斷流程，從「發現異常」到「定位根因」。
 
 **mariadb-operator 環境的特殊性**：
 - StatefulSet 管理 pod — pod 名稱固定（`<sts>-0`, `<sts>-1`, ...），PVC 不會因重啟而改變
 - Operator 會主動觸發 pod 重啟（rolling update、switchover、failover）
 - Liveness/readiness probe 由 operator 設定，失敗時會導致 container 被 kill 或 pod 從 service 移除
+
+---
+
+## 零、怎麼發現 pod 重啟了？
+
+你不一定會先看到 `restartCount > 0`。以下是常見的 5 個發現入口：
+
+| # | 線索 | 你看到什麼 | 怎麼確認 |
+|---|------|-----------|---------|
+| 1 | **Pod AGE 很短** | `kubectl get pods` 某個 pod AGE 只有幾分鐘，其他 AGE 很長 | 比較同 StatefulSet 的其他 pod |
+| 2 | **Primary pod 換了** | `.status.currentPrimary` 變了，可能發生了 failover/switchover | `kubectl get mariadb <name> -o jsonpath='{.status.currentPrimary}'` |
+| 3 | **MariaDB uptime 很短** | 進 DB 查 `SELECT @@uptime` 回傳很小的數字 | 與 container startedAt 比較 |
+| 4 | **Grafana/監控異常** | Connection drop、replication lag spike、metrics 斷點 | 查看對應時間點的 events |
+| 5 | **Error log 有 startup 記錄** | `kubectl logs` 看到 MariaDB shutdown/startup 序列 | `kubectl logs --previous` 看上一次 |
+
+### RESTARTS 欄 vs AGE — 兩種不同的「重啟」
+
+```bash
+# 先看這兩個欄位
+kubectl --context=kind-mdb -n default get pods -l app.kubernetes.io/instance=mariadb-chaos -o wide
+```
+
+```
+NAME              READY   STATUS    RESTARTS        AGE
+mariadb-chaos-0   2/2     Running   798 (5d ago)    55d   ← AGE 長 + RESTARTS 高
+mariadb-chaos-1   2/2     Running   0               3m    ← AGE 短 + RESTARTS=0
+mariadb-chaos-2   2/2     Running   169 (3d ago)    55d   ← AGE 長 + RESTARTS 中
+```
+
+| 現象 | 發生了什麼 | 常見原因 |
+|------|-----------|---------|
+| AGE 短 + RESTARTS=0 | **Pod 被 delete 後重建**（全新 pod） | Operator rolling update、node drain、手動 delete、failover |
+| AGE 長 + RESTARTS 高 | **Container 在同一個 pod 內反覆重啟** | OOM、crash、liveness probe 失敗 |
+| AGE 短 + RESTARTS 高 | Pod 被重建，且重建後又有 container restart | 混合原因（例如 node 問題 + OOM） |
+
+### 區分 container restart vs pod recreate
+
+```bash
+# 查看 pod UID — 如果 UID 與你記得的不同，就是新 pod（recreate）
+kubectl --context=kind-mdb -n default get pod mariadb-chaos-0 \
+  -o jsonpath='uid={.metadata.uid} created={.metadata.creationTimestamp}'
+
+# 查看 container 的重啟次數和狀態
+kubectl --context=kind-mdb -n default get pod mariadb-chaos-0 \
+  -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t restarts="}{.restartCount}{"\t started="}{.state.running.startedAt}{"\n"}{end}'
+```
+
+**關鍵概念**：
+- **Container restart**：同一個 pod UID，`restartCount` 增加，pod AGE 不變。kubelet 在原地重啟 container。
+- **Pod recreate**：新的 pod UID，AGE 重置，`restartCount` 從 0 開始。StatefulSet controller 建了一個全新 pod。
+
+### 確認 primary 是否有變
+
+```bash
+# 查看目前的 primary
+kubectl --context=kind-mdb -n default get mariadb mariadb-chaos \
+  -o jsonpath='currentPrimary={.status.currentPrimary}'
+
+# 檢查 operator logs 是否有 switchover/failover 記錄
+OPERATOR_POD=$(kubectl --context=kind-mdb -n mariadb-operator-system get pods \
+  -l control-plane=mariadb-operator-controller-manager -o name | head -1)
+kubectl --context=kind-mdb -n mariadb-operator-system logs "$OPERATOR_POD" --since=1h | \
+  grep -i -E "switchover|failover"
+```
+
+確認完「發生了什麼」之後，進入下方的診斷流程圖。
 
 ---
 
@@ -751,7 +817,170 @@ done
 
 ---
 
-## 七、常見場景速查表
+## 七、PromQL 監控與告警規則
+
+除了被動診斷，你也可以用 Prometheus 主動偵測 pod restart 問題。
+
+### 7.1 常用 PromQL 查詢
+
+在 Grafana 或 Prometheus UI 中直接使用：
+
+```promql
+# 過去 1 小時的 container 重啟次數（依 pod + container 分組）
+increase(kube_pod_container_status_restarts_total{namespace="default", pod=~"mariadb-chaos-.*"}[1h])
+
+# 偵測 OOMKilled（最近一次終止原因是 OOMKilled 的 container）
+kube_pod_container_status_last_terminated_reason{namespace="default", pod=~"mariadb-chaos-.*", reason="OOMKilled"} > 0
+
+# 偵測 CrashLoopBackOff
+kube_pod_container_status_waiting_reason{namespace="default", pod=~"mariadb-chaos-.*", reason="CrashLoopBackOff"} > 0
+
+# Container 記憶體使用率 vs limit（預警 OOM）
+container_memory_working_set_bytes{namespace="default", pod=~"mariadb-chaos-.*", container="mariadb"}
+  /
+kube_pod_container_resource_limits{namespace="default", pod=~"mariadb-chaos-.*", container="mariadb", resource="memory"}
+  * 100
+
+# Pod 是否 Ready（0 = NotReady，可能觸發 failover）
+kube_pod_status_ready{namespace="default", pod=~"mariadb-chaos-.*", condition="true"} == 0
+```
+
+### 7.2 PrometheusRule YAML
+
+以下是完整的告警規則，可直接 `kubectl apply`（需要已安裝 kube-prometheus-stack）：
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: mariadb-pod-restart-alerts
+  namespace: default
+  labels:
+    release: kube-prometheus-stack  # 依你的 Prometheus 安裝調整
+spec:
+  groups:
+  - name: mariadb-pod-restart
+    rules:
+
+    # --- Container 重啟過多 ---
+    - alert: MariaDBPodRestarting
+      expr: |
+        increase(
+          kube_pod_container_status_restarts_total{
+            namespace="default",
+            pod=~"mariadb-chaos-.*",
+            container="mariadb"
+          }[1h]
+        ) > 3
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MariaDB container 頻繁重啟"
+        description: |
+          Pod {{ $labels.pod }} 的 mariadb container 在過去 1 小時內重啟了 {{ $value | printf "%.0f" }} 次。
+          診斷：查看 §一 快速分類，執行 kubectl logs {{ $labels.pod }} -c mariadb --previous
+
+    # --- OOMKilled ---
+    - alert: MariaDBPodOOMKilled
+      expr: |
+        kube_pod_container_status_last_terminated_reason{
+          namespace="default",
+          pod=~"mariadb-chaos-.*",
+          container="mariadb",
+          reason="OOMKilled"
+        } > 0
+      for: 0m
+      labels:
+        severity: critical
+      annotations:
+        summary: "MariaDB container 被 OOMKilled"
+        description: |
+          Pod {{ $labels.pod }} 的 mariadb container 最近一次終止原因是 OOMKilled。
+          診斷：見 §3.1，執行 check_oom.sh 檢查記憶體配置。
+
+    # --- CrashLoopBackOff ---
+    - alert: MariaDBPodCrashLooping
+      expr: |
+        kube_pod_container_status_waiting_reason{
+          namespace="default",
+          pod=~"mariadb-chaos-.*",
+          container="mariadb",
+          reason="CrashLoopBackOff"
+        } > 0
+      for: 5m
+      labels:
+        severity: critical
+      annotations:
+        summary: "MariaDB container 進入 CrashLoopBackOff"
+        description: |
+          Pod {{ $labels.pod }} 的 mariadb container 持續 crash。
+          診斷：見 §3.2，執行 kubectl logs {{ $labels.pod }} -c mariadb --previous
+
+    # --- 記憶體使用率接近 limit（OOM 預警）---
+    - alert: MariaDBMemoryNearLimit
+      expr: |
+        (
+          container_memory_working_set_bytes{
+            namespace="default",
+            pod=~"mariadb-chaos-.*",
+            container="mariadb"
+          }
+          /
+          kube_pod_container_resource_limits{
+            namespace="default",
+            pod=~"mariadb-chaos-.*",
+            container="mariadb",
+            resource="memory"
+          }
+        ) > 0.9
+      for: 10m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MariaDB 記憶體使用率 > 90%"
+        description: |
+          Pod {{ $labels.pod }} 的記憶體使用率為 {{ $value | printf "%.1f" }}%，接近 limit。
+          可能即將 OOMKilled。診斷：見 §3.1，執行 check_oom.sh。
+
+    # --- Agent sidecar 重啟（影響 health check）---
+    - alert: MariaDBAgentRestarting
+      expr: |
+        increase(
+          kube_pod_container_status_restarts_total{
+            namespace="default",
+            pod=~"mariadb-chaos-.*",
+            container="agent"
+          }[1h]
+        ) > 3
+      for: 5m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MariaDB agent sidecar 頻繁重啟"
+        description: |
+          Pod {{ $labels.pod }} 的 agent container 在過去 1 小時內重啟了 {{ $value | printf "%.0f" }} 次。
+          Agent 負責 liveness/readiness probe（port 5566），agent 重啟可能導致 mariadb container 也被重啟。
+          診斷：見 §3.3，執行 kubectl logs {{ $labels.pod }} -c agent
+```
+
+### 7.3 Alert 與診斷章節對照
+
+| Alert | Severity | 觸發條件 | 對應章節 |
+|-------|----------|---------|---------|
+| MariaDBPodRestarting | warning | 1h 內重啟 > 3 次 | §一 快速分類 |
+| MariaDBPodOOMKilled | critical | 最近終止原因 = OOMKilled | §3.1 OOMKilled |
+| MariaDBPodCrashLooping | critical | CrashLoopBackOff 持續 5 分鐘 | §3.2 CrashLoopBackOff |
+| MariaDBMemoryNearLimit | warning | 記憶體 > 90% limit 持續 10 分鐘 | §3.1 OOMKilled（預警） |
+| MariaDBAgentRestarting | warning | agent 1h 內重啟 > 3 次 | §3.3 Liveness Probe |
+
+**注意**：以上 YAML 中的 `namespace` 和 `pod` regex 需要根據你的環境調整。PromQL 查詢需要 [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) 和 [cAdvisor](https://github.com/google/cadvisor) 提供的 metrics。
+
+更多 PromQL 技巧見 [`tools/07-pvc-multiattach-promql.md`](./07-pvc-multiattach-promql.md)。
+
+---
+
+## 八、常見場景速查表
 
 | 你看到什麼 | 最可能的原因 | 查什麼 |
 |-----------|-------------|--------|
