@@ -1081,6 +1081,135 @@ spec:
 
 更多 PromQL 技巧見 [`tools/07-pvc-multiattach-promql.md`](./07-pvc-multiattach-promql.md)。
 
+### 7.4 Connection Spike 偵測
+
+#### 問題：為什麼現有的 `for` alert 會漏掉 spike？
+
+```
+現有 alert 能抓到的情況（緩慢增長）：
+  connections ── 75% ── 80% ── 85% ── 持續 5 分鐘 ── alert 觸發 ✓
+                                       ◄── for: 5m ──►
+
+漏掉的情況（突然暴衝）：
+  connections ── 30% ── spike 到 100% ── probe 失敗 ── failover ── 歸零
+                        ◄── < 1 分鐘 ──►
+                        for: 5m 還沒到就結束了 ✗
+
+更糟的情況（兩次 scrape 之間）：
+  scrape          scrape          scrape
+    |               |               |
+    ▼               ▼               ▼
+    30%   （spike 到 100% → failover → 歸零）   5%
+           ← 發生在兩次 scrape 之間 →
+           Prometheus 完全沒看到 ✗✗
+```
+
+#### 解決方案：4 條互補的 alert rules
+
+以下 alert 使用 **mysqld_exporter** 提供的 metrics（前綴 `mysql_*`）。
+
+```yaml
+# === Connection Spike Alert Rules ===
+# 與現有的 0.75/0.80/0.85 + for:10m/5m/3m 搭配使用
+
+# --- Alert 1：即時 spike（for: 0m，一觸即發）---
+# 連線率超過 95% 立刻告警，不等待持續時間
+- alert: MariaDBConnectionSpike
+  expr: |
+    mysql_global_status_threads_connected
+      / mysql_global_variables_max_connections > 0.95
+  for: 0m
+  labels:
+    severity: critical
+  annotations:
+    summary: "MariaDB 連線數 spike > 95%"
+    description: |
+      {{ $labels.instance }} 的連線使用率為 {{ $value | printf "%.1f" }}%。
+      連線數接近 max_connections，可能即將觸發 probe 失敗和 failover。
+      立即檢查是否有 App 連線暴衝。
+
+# --- Alert 2：連線增長速率異常（抓上升趨勢）---
+# 5 分鐘內連線數增加超過 max_connections 的 30%
+# 能在 spike 還在上升階段就抓到，比 threshold alert 更早
+- alert: MariaDBConnectionSurge
+  expr: |
+    delta(mysql_global_status_threads_connected[5m])
+      > mysql_global_variables_max_connections * 0.3
+  for: 0m
+  labels:
+    severity: warning
+  annotations:
+    summary: "MariaDB 連線數異常增長"
+    description: |
+      {{ $labels.instance }} 在過去 5 分鐘內連線數增加了 {{ $value | printf "%.0f" }}。
+      增長速率超過 max_connections 的 30%，可能有連線暴衝。
+
+# --- Alert 3：事後偵測 — 連線被拒 counter ---
+# 確認曾因 max_connections 被拒連線
+# ⚠️ 需確認你的 mysqld_exporter 有輸出此 metric，沒有則註解掉
+- alert: MariaDBConnectionErrorsDetected
+  expr: |
+    increase(mysql_global_status_connection_errors_max_connections[5m]) > 0
+  for: 0m
+  labels:
+    severity: critical
+  annotations:
+    summary: "MariaDB 偵測到 max_connections 連線被拒"
+    description: |
+      {{ $labels.instance }} 在過去 5 分鐘內有連線因 max_connections 上限被拒絕。
+      即使 spike 已過，此 counter 證明 max_connections 曾經被打滿。
+
+# --- Alert 4：事後偵測 — 歷史高水位 ---
+# Max_used_connections 是 MariaDB 啟動以來的歷史最高連線數
+# ⚠️ 需確認你的 mysqld_exporter 有輸出此 metric，沒有則註解掉
+- alert: MariaDBMaxUsedConnectionsHigh
+  expr: |
+    mysql_global_status_max_used_connections
+      / mysql_global_variables_max_connections > 0.95
+  for: 0m
+  labels:
+    severity: warning
+  annotations:
+    summary: "MariaDB 歷史最高連線數 > 95%"
+    description: |
+      {{ $labels.instance }} 自啟動以來的最高連線數為 {{ $value | printf "%.0f" }}，
+      超過 max_connections 的 95%。表示曾經接近上限，有被打滿的風險。
+```
+
+#### Alert 搭配策略
+
+| Alert | 偵測時機 | 能抓到 spike？ | Severity |
+|-------|---------|---------------|----------|
+| 現有 0.75/0.80/0.85 + for | 緩慢增長 | 不能（for 來不及） | warning |
+| **MariaDBConnectionSpike** | spike 瞬間 | **能**（如果 scrape 有抓到） | critical |
+| **MariaDBConnectionSurge** | spike 上升階段 | **能**（看 5m 趨勢） | warning |
+| **MariaDBConnectionErrorsDetected** | spike 之後 | 盡力（需 scrape 到 counter） | critical |
+| **MariaDBMaxUsedConnectionsHigh** | 啟動以來 | 是（只要 scrape 到就會觸發） | warning |
+
+#### 事後偵測的限制
+
+- Alert 3 和 4 需要確認你的 mysqld_exporter 有輸出對應 metric（`connection_errors_max_connections`、`max_used_connections`）
+- 如果內部系統沒有這些 metric，先註解掉，未來啟用時取消註解
+- MariaDB process restart 後，in-memory counter（`Connection_errors_max_connections`）歸零
+- 如果 spike + failover 在兩次 scrape 之間全部完成，事後偵測也可能漏掉
+
+#### 無法解決的盲區
+
+即使加了以上所有 alert，仍有一個**無法用 Prometheus 解決的盲區**：
+
+```
+如果 spike 發生並完成在兩次 scrape 之間（例如 30 秒或 120 秒的間隔內）：
+→ Alert 1（threshold）：沒抓到
+→ Alert 2（rate）：只看到 30% → 5%，像正常下降
+→ Alert 3（counter）：counter 增加沒被 scrape
+→ Alert 4（高水位）：可能抓到（Max_used_connections 值會保留直到 restart）✓
+
+唯一保證能事後發現的方法：
+→ 查 operator logs 的 failover 記錄
+→ 查 MariaDB error log 的 "Too many connections"
+→ 查 SHOW GLOBAL STATUS LIKE 'Max_used_connections'（手動 SQL）
+```
+
 ---
 
 ## 八、常見場景速查表
