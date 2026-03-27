@@ -1178,11 +1178,16 @@ spec:
     description: |
       {{ $labels.instance }} 在過去 5 分鐘內連線峰值達到 max_connections 的 {{ $value | printf "%.0f" }}%。
 
-# --- 方案 C：連線增長斜率 ---
+# --- 方案 C：連線增長斜率（★ 實測效果最佳）---
 # 窗口設 5 分鐘，抓持續上升的趨勢
+# deriv 單位是「每秒」，0.03/s ≈ 每 5 分鐘增加 ~9 個連線
+# 實測此值比 > 1（每秒 +1，太高）更能抓到實際 spike
+# AND > 50% max 過濾誤報（正常小波動不觸發）
+# Trade-off：可能只看到 1-2 個資料點（spike 早期連線還沒到 50% 的點會被過濾）
+#            但搭配 Alert 2a/2b/4 一起用，整體覆蓋率足夠
 - alert: MariaDBConnectionRising
   expr: |
-    deriv(mysql_global_status_threads_connected[5m]) > 1
+    deriv(mysql_global_status_threads_connected[5m]) > 0.03
     and
     mysql_global_status_threads_connected
       / mysql_global_variables_max_connections > 0.5
@@ -1237,7 +1242,7 @@ spec:
 | Alert 1: **ConnectionSpike** | spike 瞬間 | △ 如果 scrape 恰好抓到 | critical |
 | Alert 2a: **ConnectionSurge** | spike 上升（> 1.5× 基線 + > 50% max） | △ 如果 scrape 抓到 | warning |
 | Alert 2b: **ConnectionPeak** | 5 分鐘內峰值 > 70% max | △ 如果 scrape 抓到 | warning |
-| Alert 2c: **ConnectionRising** | 5 分鐘斜率 > 1/s + > 50% max | △ 如果 scrape 抓到 | warning |
+| Alert 2c: **ConnectionRising** ★ | 5 分鐘斜率 > 0.03/s + > 50% max | △ 如果 scrape 抓到（實測效果最佳，無誤報） | warning |
 | Alert 3: **ConnectionErrors** | spike 之後 | △ 如果 counter 被 scrape 到 | critical |
 | Alert 4: **MaxUsedConnHigh** ★ | **啟動以來** | **✓ 高水位不會降，下次 scrape 一定看到** | critical |
 
