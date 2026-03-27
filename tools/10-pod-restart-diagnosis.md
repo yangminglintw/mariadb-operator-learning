@@ -1128,21 +1128,29 @@ spec:
       連線數接近 max_connections，可能即將觸發 probe 失敗和 failover。
       立即檢查是否有 App 連線暴衝。
 
-# --- Alert 2：連線增長速率異常（抓上升趨勢）---
-# 5 分鐘內連線數增加超過 max_connections 的 30%
-# 能在 spike 還在上升階段就抓到，比 threshold alert 更早
+# --- Alert 2：連線異常暴增（基於歷史基線，自動適應不同規格）---
+# 條件：當前連線數 > 過去 1 小時平均的 3 倍 AND 已超過 max_connections 的 50%
+# 自動適應不同 max_connections 規格（100/300/800），不需手動設門檻
+# 能在 spike 還在上升階段就抓到
 - alert: MariaDBConnectionSurge
   expr: |
-    delta(mysql_global_status_threads_connected[5m])
-      > mysql_global_variables_max_connections * 0.3
+    (
+      mysql_global_status_threads_connected
+        > 3 * avg_over_time(mysql_global_status_threads_connected[1h])
+    )
+    and
+    (
+      mysql_global_status_threads_connected
+        / mysql_global_variables_max_connections > 0.5
+    )
   for: 0m
   labels:
     severity: warning
   annotations:
-    summary: "MariaDB 連線數異常增長"
+    summary: "MariaDB 連線數異常暴增"
     description: |
-      {{ $labels.instance }} 在過去 5 分鐘內連線數增加了 {{ $value | printf "%.0f" }}。
-      增長速率超過 max_connections 的 30%，可能有連線暴衝。
+      {{ $labels.instance }} 當前連線數超過過去 1 小時平均的 3 倍，
+      且已超過 max_connections 的 50%。可能有連線暴衝。
 
 # --- Alert 3：事後偵測 — 連線被拒 counter ---
 # 確認曾因 max_connections 被拒連線
@@ -1182,7 +1190,7 @@ spec:
 |-------|---------|---------------|----------|
 | 現有 0.75/0.80/0.85 + for | 緩慢增長 | 不能（for 來不及） | warning |
 | **MariaDBConnectionSpike** | spike 瞬間 | **能**（如果 scrape 有抓到） | critical |
-| **MariaDBConnectionSurge** | spike 上升階段 | **能**（看 5m 趨勢） | warning |
+| **MariaDBConnectionSurge** | spike 上升階段 | **能**（> 1h 平均 3 倍 + > 50% max） | warning |
 | **MariaDBConnectionErrorsDetected** | spike 之後 | 盡力（需 scrape 到 counter） | critical |
 | **MariaDBMaxUsedConnectionsHigh** | 啟動以來 | 是（只要 scrape 到就會觸發） | warning |
 
@@ -1200,7 +1208,7 @@ spec:
 ```
 如果 spike 發生並完成在兩次 scrape 之間（例如 30 秒或 120 秒的間隔內）：
 → Alert 1（threshold）：沒抓到
-→ Alert 2（rate）：只看到 30% → 5%，像正常下降
+→ Alert 2（surge）：avg_over_time 來不及反映，或 spike 太短
 → Alert 3（counter）：counter 增加沒被 scrape
 → Alert 4（高水位）：可能抓到（Max_used_connections 值會保留直到 restart）✓
 
