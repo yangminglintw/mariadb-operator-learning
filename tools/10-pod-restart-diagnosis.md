@@ -1129,14 +1129,16 @@ spec:
       立即檢查是否有 App 連線暴衝。
 
 # --- Alert 2：連線異常暴增（基於歷史基線，自動適應不同規格）---
-# 條件：當前連線數 > 過去 1 小時平均的 3 倍 AND 已超過 max_connections 的 50%
-# 自動適應不同 max_connections 規格（100/300/800），不需手動設門檻
-# 能在 spike 還在上升階段就抓到
+# 條件：當前連線數 > 過去 1 小時平均的 2 倍 AND 已超過 max_connections 的 50%
+# 為什麼是 2 倍而不是 3 倍：
+#   實際場景中 baseline 可能已達 max 的 40%（例如 max=100, 平常=40）
+#   3 倍 = 120 > max_connections，永遠觸發不了
+#   2 倍 = 80，在打滿之前還有機會告警
 - alert: MariaDBConnectionSurge
   expr: |
     (
       mysql_global_status_threads_connected
-        > 3 * avg_over_time(mysql_global_status_threads_connected[1h])
+        > 2 * avg_over_time(mysql_global_status_threads_connected[1h])
     )
     and
     (
@@ -1149,7 +1151,7 @@ spec:
   annotations:
     summary: "MariaDB 連線數異常暴增"
     description: |
-      {{ $labels.instance }} 當前連線數超過過去 1 小時平均的 3 倍，
+      {{ $labels.instance }} 當前連線數超過過去 1 小時平均的 2 倍，
       且已超過 max_connections 的 50%。可能有連線暴衝。
 
 # --- Alert 3：事後偵測 — 連線被拒 counter ---
@@ -1167,32 +1169,36 @@ spec:
       {{ $labels.instance }} 在過去 5 分鐘內有連線因 max_connections 上限被拒絕。
       即使 spike 已過，此 counter 證明 max_connections 曾經被打滿。
 
-# --- Alert 4：事後偵測 — 歷史高水位 ---
-# Max_used_connections 是 MariaDB 啟動以來的歷史最高連線數
-# ⚠️ 需確認你的 mysqld_exporter 有輸出此 metric，沒有則註解掉
+# --- Alert 4：歷史高水位（★ 最可靠的 spike 偵測）---
+# max_used_connections = MariaDB 啟動以來的歷史最高連線數（high watermark）
+# 關鍵優勢：即使 spike 在兩次 scrape 之間完成，值仍然停在最高點
+# 這是唯一能在 scrape 盲區中仍然偵測到 spike 的 metric
 - alert: MariaDBMaxUsedConnectionsHigh
   expr: |
     mysql_global_status_max_used_connections
-      / mysql_global_variables_max_connections > 0.95
+      / mysql_global_variables_max_connections > 0.9
   for: 0m
   labels:
-    severity: warning
+    severity: critical
   annotations:
-    summary: "MariaDB 歷史最高連線數 > 95%"
+    summary: "MariaDB 歷史最高連線數 > 90%"
     description: |
-      {{ $labels.instance }} 自啟動以來的最高連線數為 {{ $value | printf "%.0f" }}，
-      超過 max_connections 的 95%。表示曾經接近上限，有被打滿的風險。
+      {{ $labels.instance }} 自啟動以來的最高連線數達到 max_connections 的 {{ $value | printf "%.0f" }}%。
+      即使 spike 已過，此高水位證明曾接近上限。
+      注意：此值在 MariaDB restart 後歸零。
 ```
 
 #### Alert 搭配策略
 
-| Alert | 偵測時機 | 能抓到 spike？ | Severity |
-|-------|---------|---------------|----------|
-| 現有 0.75/0.80/0.85 + for | 緩慢增長 | 不能（for 來不及） | warning |
-| **MariaDBConnectionSpike** | spike 瞬間 | **能**（如果 scrape 有抓到） | critical |
-| **MariaDBConnectionSurge** | spike 上升階段 | **能**（> 1h 平均 3 倍 + > 50% max） | warning |
-| **MariaDBConnectionErrorsDetected** | spike 之後 | 盡力（需 scrape 到 counter） | critical |
-| **MariaDBMaxUsedConnectionsHigh** | 啟動以來 | 是（只要 scrape 到就會觸發） | warning |
+| Alert | 偵測時機 | 能抓到 scrape 盲區的 spike？ | Severity |
+|-------|---------|------|----------|
+| 現有 0.75/0.80/0.85 + for | 緩慢增長 | ✗ for 來不及 | warning |
+| Alert 1: **ConnectionSpike** | spike 瞬間 | △ 如果 scrape 恰好抓到 | critical |
+| Alert 2: **ConnectionSurge** | spike 上升階段 | △ 如果 scrape 恰好抓到 | warning |
+| Alert 3: **ConnectionErrors** | spike 之後 | △ 如果 counter 被 scrape 到 | critical |
+| Alert 4: **MaxUsedConnHigh** ★ | **啟動以來** | **✓ 高水位不會降，下次 scrape 一定看到** | critical |
+
+**★ Alert 4 是唯一能可靠偵測 scrape 盲區 spike 的 alert**，因為 `max_used_connections` 是高水位標記，spike 過了也不降。
 
 #### 事後偵測的限制
 
