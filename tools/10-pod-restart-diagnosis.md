@@ -1128,17 +1128,27 @@ spec:
       連線數接近 max_connections，可能即將觸發 probe 失敗和 failover。
       立即檢查是否有 App 連線暴衝。
 
-# --- Alert 2：連線異常暴增（基於歷史基線，自動適應不同規格）---
-# 條件：當前連線數 > 過去 1 小時平均的 2 倍 AND 已超過 max_connections 的 50%
-# 為什麼是 2 倍而不是 3 倍：
-#   實際場景中 baseline 可能已達 max 的 40%（例如 max=100, 平常=40）
-#   3 倍 = 120 > max_connections，永遠觸發不了
-#   2 倍 = 80，在打滿之前還有機會告警
+# --- Alert 2：連線異常暴增 ---
+# 以下提供 3 種方案，依你的環境選擇最適合的（取消註解即可）
+#
+# 方案 A：基線倍數（自動適應不同規格）
+#   平常 40，1.5× = 60 就觸發，門檻比 2× 更敏感
+#   + 必須超過 50% max 避免低基線誤報
+#
+# 方案 B：最近 2 分鐘最高點（不錯過任何一次 scrape 的高點）
+#   用 max_over_time 抓 2 分鐘窗口內的最大值
+#   即使只有一次 scrape 抓到 spike，也能觸發
+#
+# 方案 C：變化斜率（抓「正在暴衝」的瞬間）
+#   用 deriv() 偵測連線數上升速度
+#   適合 spike 有上升過程（不是瞬間跳到 max）的情境
+
+# --- 方案 A：基線 1.5 倍 + 50% max ---
 - alert: MariaDBConnectionSurge
   expr: |
     (
       mysql_global_status_threads_connected
-        > 2 * avg_over_time(mysql_global_status_threads_connected[1h])
+        > 1.5 * avg_over_time(mysql_global_status_threads_connected[1h])
     )
     and
     (
@@ -1151,8 +1161,37 @@ spec:
   annotations:
     summary: "MariaDB 連線數異常暴增"
     description: |
-      {{ $labels.instance }} 當前連線數超過過去 1 小時平均的 2 倍，
-      且已超過 max_connections 的 50%。可能有連線暴衝。
+      {{ $labels.instance }} 當前連線數超過過去 1 小時平均的 1.5 倍，
+      且已超過 max_connections 的 50%。
+
+# --- 方案 B：2 分鐘內最高點 > 70% max（取消註解使用）---
+# - alert: MariaDBConnectionSurge
+#   expr: |
+#     max_over_time(mysql_global_status_threads_connected[2m])
+#       / mysql_global_variables_max_connections > 0.7
+#   for: 0m
+#   labels:
+#     severity: warning
+#   annotations:
+#     summary: "MariaDB 連線數 2 分鐘內峰值 > 70%"
+#     description: |
+#       {{ $labels.instance }} 在過去 2 分鐘內連線峰值達到 max_connections 的 {{ $value | printf "%.0f" }}%。
+
+# --- 方案 C：連線增長斜率（取消註解使用）---
+# - alert: MariaDBConnectionSurge
+#   expr: |
+#     deriv(mysql_global_status_threads_connected[2m]) > 1
+#     and
+#     mysql_global_status_threads_connected
+#       / mysql_global_variables_max_connections > 0.5
+#   for: 0m
+#   labels:
+#     severity: warning
+#   annotations:
+#     summary: "MariaDB 連線數快速上升"
+#     description: |
+#       {{ $labels.instance }} 連線數正在快速增長（每秒 +{{ $value | printf "%.1f" }}），
+#       且已超過 max_connections 的 50%。
 
 # --- Alert 3：事後偵測 — 連線被拒 counter ---
 # 確認曾因 max_connections 被拒連線
@@ -1194,7 +1233,7 @@ spec:
 |-------|---------|------|----------|
 | 現有 0.75/0.80/0.85 + for | 緩慢增長 | ✗ for 來不及 | warning |
 | Alert 1: **ConnectionSpike** | spike 瞬間 | △ 如果 scrape 恰好抓到 | critical |
-| Alert 2: **ConnectionSurge** | spike 上升階段 | △ 如果 scrape 恰好抓到 | warning |
+| Alert 2: **ConnectionSurge** | spike 上升階段 | △ 如果 scrape 恰好抓到（3 種方案可選） | warning |
 | Alert 3: **ConnectionErrors** | spike 之後 | △ 如果 counter 被 scrape 到 | critical |
 | Alert 4: **MaxUsedConnHigh** ★ | **啟動以來** | **✓ 高水位不會降，下次 scrape 一定看到** | critical |
 
