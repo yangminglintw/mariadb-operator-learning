@@ -485,6 +485,87 @@ kubectl --context=kind-mdb top node "$NODE"
 
 Failover 相關流程見 [`concepts/10-failover.md`](../concepts/10-failover.md)。
 
+#### Node NotReady 告警規則
+
+**常見錯誤寫法（反向斷言）**：
+
+```promql
+# ✗ 反向斷言 — fragile pattern
+kube_node_status_condition{condition="Ready", status="true"}
+  * on (node) group_right
+  kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}
+  == 0
+```
+
+此寫法有三個問題：
+
+1. **Staleness phantom firing** — node NotReady 期間 kubelet 可能停擺，`status="true"` series 最後值為 0。Prometheus 保留 stale 值約 5 分鐘。node 恢復後 fresh series（值=1）與 stale series（值=0）短暫共存，join 可能匹配到 stale 的 0 值，導致 alert 在 node 已恢復後仍然觸發
+2. **漏掉 Unknown 狀態** — kubelet 失聯時 node condition 是 `Unknown`，不是 `False`。只查 `status="true" == 0` 無法涵蓋
+3. **`kube_pod_info` stale series** — failover 期間 pod 被 reschedule，舊 `kube_pod_info`（指向故障 node）持續 stale ~5 分鐘，join 可能匹配到舊 series
+
+> 經驗法則（詳見 [`07-pvc-multiattach-promql.md`](./07-pvc-multiattach-promql.md) §正向斷言）：
+> `metric{status="true"} == 0` 在 series 消失時回傳 empty（漏報）；`metric{status="false"} == 1` 只要故障 series 存在就觸發（安全）。
+
+**正確寫法（正向斷言）**：
+
+```promql
+# ✓ 正向斷言 — MariaDB replication pods 在 NotReady node 上
+(
+  max by (node, namespace, pod) (
+    kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}
+  )
+)
+  * on(node) group_left()
+  (
+    kube_node_status_condition{condition="Ready", status="false"} == 1
+      or
+    kube_node_status_condition{condition="Ready", status="unknown"} == 1
+  )
+```
+
+設計要點：
+- `max by(node, namespace, pod)` — 去重 stale `kube_pod_info` series，避免 pod reschedule 時 many-to-many 錯誤
+- `status="false"` + `status="unknown"` — 覆蓋 NotReady 和 kubelet 失聯兩種情況
+- 正向斷言 — series 消失時 alert 自動解除（safe fail-open），不會 phantom firing
+
+**反向 vs 正向對照**：
+
+| 場景 | 反向 `status="true" == 0` | 正向 `status="false" == 1` |
+|------|--------------------------|---------------------------|
+| series 消失 | empty → 漏報 | empty → alert 解除（安全） |
+| node 恢復後 stale 期間 | stale value=0 → phantom firing | fresh value 回到 0 → alert 正確解除 |
+| kubelet 失聯 | `status="true"` 可能消失 → 漏報 | `status="unknown"` 出現 → 正確觸發 |
+| `kube_pod_info` 去重 | 未處理 → many-to-many 風險 | `max by()` → 安全 |
+
+#### 事後查詢：為什麼在 Prometheus 找不到 alert 觸發時的 metrics
+
+**問題**：alert 觸發了，但事後用同一條 PromQL 查該時間點，卻查不到結果。
+
+**為什麼找不到**：
+
+1. **Staleness（~5 分鐘）** — `kube_node_status_condition` 來自 kube-state-metrics（scrape API server），node 故障時**不會消失**。但 `kube_pod_info` 可能在 pod reschedule 後產生新 series（node label 改變），舊 series 變 stale。事後查詢時 join 的兩邊在該時間點可能沒有 node label 匹配的 sample
+2. **kube_pod_info node label 改變** — pod 被 reschedule 到新 node 後，`kube_pod_info` 的 `node` label 指向新 node（Ready），與 NotReady node 的 condition 無法 join
+3. **Graph step resolution 太粗** — Prometheus UI 的 Graph tab 會根據時間範圍自動調整 step（1h → ~15s、6h → ~60s、24h → ~250s）。如果 NotReady 窗口 < step，該數據點會被跳過
+
+**正確查歷史的方法**：
+
+```promql
+# 1. 分別查各部分（不做 join），確認各自有值
+#    用短時間範圍（alert 時間 ± 5 分鐘）
+kube_node_status_condition{condition="Ready", node="你的node名稱"}
+
+kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}
+
+# 2. 用正向斷言查 — 在 graph 上更容易看到 NotReady 時段
+kube_node_status_condition{condition="Ready", status="false", node="你的node名稱"} == 1
+
+# 3. 直接查 ALERTS metric — Prometheus 會記錄每個 alert 的狀態變化
+ALERTS{alertname="MariaDBReplicaOnNotReadyNode"}
+#   value=1 表示 alert 正在 firing/pending
+```
+
+> **注意**：`kube_node_status_condition` 和 `kube_pod_info` 都來自 kube-state-metrics，資料來源是 Kubernetes API server，不是 node 本身。node 故障時這些 metrics **不會消失**（API server 仍然知道 node 是 NotReady）。會消失的是直接從 node scrape 的 metrics（node-exporter、kubelet/cAdvisor）。
+
 ### 3.6 Operator 觸發的重啟
 
 **特徵**：
@@ -1065,6 +1146,52 @@ spec:
           Pod {{ $labels.pod }} 的 agent container 在過去 1 小時內重啟了 {{ $value | printf "%.0f" }} 次。
           Agent 負責 liveness/readiness probe（port 5566），agent 重啟可能導致 mariadb container 也被重啟。
           診斷：見 §3.3，執行 kubectl logs {{ $labels.pod }} -c agent
+
+    # --- MariaDB repl pod 在 NotReady node 上 ---
+    - alert: MariaDBReplicaOnNotReadyNode
+      expr: |
+        (
+          max by (node, namespace, pod) (
+            kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}
+          )
+        )
+          * on(node) group_left()
+          (
+            kube_node_status_condition{condition="Ready", status="false"} == 1
+              or
+            kube_node_status_condition{condition="Ready", status="unknown"} == 1
+          )
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MariaDB replica pod 在 NotReady node 上"
+        description: |
+          Pod {{ $labels.pod }} 所在的 node {{ $labels.node }} 狀態為 NotReady 或 Unknown。
+          可能觸發 failover 或造成 replica lag。診斷：見 §3.5 Node 問題。
+
+    # --- MariaDB gateway pod 在 NotReady node 上 ---
+    - alert: MariaDBGatewayOnNotReadyNode
+      expr: |
+        (
+          max by (node, namespace, pod) (
+            kube_pod_info{pod=~".*-nrigw-.*"}
+          )
+        )
+          * on(node) group_left()
+          (
+            kube_node_status_condition{condition="Ready", status="false"} == 1
+              or
+            kube_node_status_condition{condition="Ready", status="unknown"} == 1
+          )
+      for: 2m
+      labels:
+        severity: warning
+      annotations:
+        summary: "MariaDB gateway pod 在 NotReady node 上"
+        description: |
+          Gateway pod {{ $labels.pod }} 所在的 node {{ $labels.node }} 狀態為 NotReady 或 Unknown。
+          使用者可能無法連線到資料庫。診斷：見 §3.5 Node 問題。
 ```
 
 ### 7.3 Alert 與診斷章節對照
@@ -1076,6 +1203,8 @@ spec:
 | MariaDBPodCrashLooping | critical | CrashLoopBackOff 持續 5 分鐘 | §3.2 CrashLoopBackOff |
 | MariaDBMemoryNearLimit | warning | 記憶體 > 90% limit 持續 10 分鐘 | §3.1 OOMKilled（預警） |
 | MariaDBAgentRestarting | warning | agent 1h 內重啟 > 3 次 | §3.3 Liveness Probe |
+| MariaDBReplicaOnNotReadyNode | warning | repl pod 在 NotReady/Unknown node 上持續 2m | §3.5 Node 問題 |
+| MariaDBGatewayOnNotReadyNode | warning | gateway pod 在 NotReady/Unknown node 上持續 2m | §3.5 Node 問題 |
 
 **注意**：以上 YAML 中的 `namespace` 和 `pod` regex 需要根據你的環境調整。PromQL 查詢需要 [kube-state-metrics](https://github.com/kubernetes/kube-state-metrics) 和 [cAdvisor](https://github.com/google/cadvisor) 提供的 metrics。
 
