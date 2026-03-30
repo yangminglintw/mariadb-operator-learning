@@ -21,26 +21,40 @@ CALL process_orders();
 -- Queries  += 51（CALL + 50 條內部 SQL）
 ```
 
-### 為什麼兩個都要監控
+### Primary vs Replica 的差異
 
-| 情境 | Questions | Queries | 意義 |
-|------|-----------|---------|------|
-| 正常 | 穩定 | 穩定 | 無異常 |
-| Client 暴增 | ↑ 飆升 | ↑ 飆升 | App 連線暴衝 |
-| Procedure 變複雜 | 穩定 | ↑ 飆升 | 內部 query 負擔增加 |
-| 效能劣化 | 穩定 | 穩定 | 不是 QPS 問題，看其他 metric |
+Replica 上 `Queries > Questions` 是**正常現象**，因為 replication SQL thread 重播 Primary 的寫入語句：
+
+```
+Primary:  Questions = 1000, Queries = 1000（純 client SQL）
+Replica:  Questions = 200,  Queries = 1200
+              │                  │
+              │                  └─ 200 client SELECT + 1000 replication SQL
+              └─ 200 client SELECT only
+```
+
+| 來源 | 計入 Questions | 計入 Queries |
+|------|:---:|:---:|
+| Client SQL（SELECT/INSERT/UPDATE...） | ✓ | ✓ |
+| Replication SQL thread（Replica 重播 binlog） | ✗ | ✓ |
+| Stored procedure 內部語句 | ✗ | ✓ |
+
+**此環境不允許 stored procedure**，因此：
+- **Primary 上** `Queries ≈ Questions`（差異幾乎為 0）
+- **Replica 上** `Queries > Questions`（差值 = replication 重播的寫入量，正常行為）
+- **監控重點放在 `Questions`**（client QPS），因為它更準確反映 client 負載
 
 ### 實用 PromQL
 
 ```promql
-# Client QPS（每秒 client 送來的語句數）
+# Client QPS（每秒 client 送來的語句數）— 主要監控指標
 rate(mysql_global_status_questions[5m])
 
-# 總 QPS（每秒所有語句數，含 stored procedure 內部）
+# 總 QPS（每秒所有語句數，含 replication 重播）
 rate(mysql_global_status_queries[5m])
 
-# 內部 query 比例（stored procedure / trigger 產生的額外負擔）
-(rate(mysql_global_status_queries[5m]) - rate(mysql_global_status_questions[5m])) / rate(mysql_global_status_queries[5m])
+# Replica 上的 replication 重播量（僅供觀察，不建議設 alert）
+rate(mysql_global_status_queries[5m]) - rate(mysql_global_status_questions[5m])
 ```
 
 ### 關於 `rate(mysql_global_status_queries) > 0.25` 的討論
@@ -67,16 +81,6 @@ rate(mysql_global_status_queries[5m])
   annotations:
     summary: "MariaDB client QPS spike detected"
     description: "{{ $labels.instance }} client QPS exceeds 1.5x the 1-hour average. Check for app traffic surge or runaway queries."
-
-# Internal query overhead: stored procedures/triggers generate more than 50% of total queries
-- alert: MariaDBInternalQueryOverhead
-  expr: (rate(mysql_global_status_queries[5m]) - rate(mysql_global_status_questions[5m])) / rate(mysql_global_status_queries[5m]) > 0.5
-  for: 5m
-  labels:
-    severity: warning
-  annotations:
-    summary: "MariaDB internal query overhead exceeds 50%"
-    description: "{{ $labels.instance }} stored procedures and triggers generate over 50% of total queries. Review procedure efficiency."
 
 # QPS drop: sudden drop may indicate app connection failure or upstream issue
 - alert: MariaDBQPSDrop
@@ -320,7 +324,6 @@ KILL CONNECTION 123;  → 斷開 thread 123 的整個連線
 | Alert | 偵測什麼 | for | Severity |
 |-------|---------|-----|----------|
 | MariaDBQPSSpike | Client QPS 超過基線 1.5 倍 | 2m | warning |
-| MariaDBInternalQueryOverhead | 內部 query 佔比超過 50% | 5m | warning |
 | MariaDBQPSDrop | Client QPS 跌到基線的 50% 以下 | 3m | warning |
 | MariaDBRowLockContention | 持續 3+ 個 thread 等待 row lock | 2m | warning |
 | MariaDBRowLockWaitSpike | 5 分鐘內 lock wait 增加 > 10 次 | 0m | warning |
