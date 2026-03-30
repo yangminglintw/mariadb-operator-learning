@@ -1147,51 +1147,25 @@ spec:
           Agent 負責 liveness/readiness probe（port 5566），agent 重啟可能導致 mariadb container 也被重啟。
           診斷：見 §3.3，執行 kubectl logs {{ $labels.pod }} -c agent
 
-    # --- MariaDB repl pod 在 NotReady node 上 ---
+    # --- MariaDB repl pod on NotReady node ---
     - alert: MariaDBReplicaOnNotReadyNode
-      expr: |
-        (
-          max by (node, namespace, pod) (
-            kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}
-          )
-        )
-          * on(node) group_left()
-          (
-            kube_node_status_condition{condition="Ready", status="false"} == 1
-              or
-            kube_node_status_condition{condition="Ready", status="unknown"} == 1
-          )
+      expr: max by (node, namespace, pod) (kube_pod_info{pod=~".*mariadb-repl-[0-9]+$"}) * on(node) group_left() (kube_node_status_condition{condition="Ready", status="false"} == 1 or kube_node_status_condition{condition="Ready", status="unknown"} == 1)
       for: 2m
       labels:
         severity: warning
       annotations:
-        summary: "MariaDB replica pod 在 NotReady node 上"
-        description: |
-          Pod {{ $labels.pod }} 所在的 node {{ $labels.node }} 狀態為 NotReady 或 Unknown。
-          可能觸發 failover 或造成 replica lag。診斷：見 §3.5 Node 問題。
+        summary: "MariaDB replica pod {{ $labels.pod }} is on a NotReady node {{ $labels.node }}"
+        description: "The node hosting this replica is NotReady or Unknown, which may cause failover or replica lag."
 
-    # --- MariaDB gateway pod 在 NotReady node 上 ---
+    # --- MariaDB gateway pod on NotReady node ---
     - alert: MariaDBGatewayOnNotReadyNode
-      expr: |
-        (
-          max by (node, namespace, pod) (
-            kube_pod_info{pod=~".*-nrigw-.*"}
-          )
-        )
-          * on(node) group_left()
-          (
-            kube_node_status_condition{condition="Ready", status="false"} == 1
-              or
-            kube_node_status_condition{condition="Ready", status="unknown"} == 1
-          )
+      expr: max by (node, namespace, pod) (kube_pod_info{pod=~".*-nrigw-.*"}) * on(node) group_left() (kube_node_status_condition{condition="Ready", status="false"} == 1 or kube_node_status_condition{condition="Ready", status="unknown"} == 1)
       for: 2m
       labels:
         severity: warning
       annotations:
-        summary: "MariaDB gateway pod 在 NotReady node 上"
-        description: |
-          Gateway pod {{ $labels.pod }} 所在的 node {{ $labels.node }} 狀態為 NotReady 或 Unknown。
-          使用者可能無法連線到資料庫。診斷：見 §3.5 Node 問題。
+        summary: "MariaDB gateway pod {{ $labels.pod }} is on a NotReady node {{ $labels.node }}"
+        description: "The node hosting this gateway is NotReady or Unknown, clients may be unable to connect to the database."
 ```
 
 ### 7.3 Alert 與診斷章節對照
