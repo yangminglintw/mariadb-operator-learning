@@ -74,17 +74,13 @@ Operator 直接管理 EndpointSlice（不透過 Kubernetes selector 自動生成
 
 ```yaml
 - alert: MariaDBPrimaryEndpointDown
-  expr: |
-    kube_endpoint_address_available{endpoint=~".*-primary"} == 0
+  expr: kube_endpoint_address_available{endpoint=~".*-primary"} == 0
   for: 1m
   labels:
     severity: critical
   annotations:
-    summary: "MariaDB Primary endpoint 不可用"
-    description: |
-      Service {{ $labels.endpoint }} 沒有可用的 endpoint。
-      Primary pod 可能故障，App 的寫入流量無法送達。
-      檢查：kubectl get endpoints {{ $labels.endpoint }} -n {{ $labels.namespace }}
+    summary: "MariaDB Primary endpoint is unavailable"
+    description: "Service {{ $labels.endpoint }} has no available endpoints. Primary pod may be down and write traffic cannot reach the database. Check: kubectl get endpoints {{ $labels.endpoint }} -n {{ $labels.namespace }}"
 ```
 
 #### kube-state-metrics >= v2.14（新版）
@@ -93,29 +89,25 @@ Operator 直接管理 EndpointSlice（不透過 Kubernetes selector 自動生成
 
 ```yaml
 - alert: MariaDBPrimaryEndpointDown
-  expr: |
-    kube_endpoint_address{endpoint=~".*-primary"} == 0
-    or
-    absent(kube_endpoint_address{endpoint=~".*-primary"})
+  expr: kube_endpoint_address{endpoint=~".*-primary"} == 0 or absent(kube_endpoint_address{endpoint=~".*-primary"})
   for: 1m
   labels:
     severity: critical
   annotations:
-    summary: "MariaDB Primary endpoint 不可用"
-    description: |
-      Service {{ $labels.endpoint }} 沒有可用的 endpoint。
+    summary: "MariaDB Primary endpoint is unavailable"
+    description: "Service {{ $labels.endpoint }} has no available endpoints."
 ```
 
 #### 你們內部系統的 regex 調整
 
 ```yaml
-# Community 版 service 命名：
+# Community edition service naming:
 #   <name>-primary  → regex: .*-primary
 #
-# 你們內部版命名（確認你的 service 名稱）：
+# Internal edition naming (verify your service name):
 #   <name>-mariadb-repl-primary → regex: .*-mariadb-repl-primar.*
 #
-# 根據你的環境調整 regex：
+# Adjust regex based on your environment:
 expr: kube_endpoint_address_available{endpoint=~".*-mariadb-repl-primar.*"} == 0
 ```
 
@@ -146,14 +138,14 @@ Primary Service Endpoint:
 偵測「App 能不能連到 DB」。
 
 ```yaml
-# Primary 不可用
+# Primary is unavailable
 - alert: MariaDBPrimaryEndpointDown
   expr: kube_endpoint_address_available{endpoint=~".*-primary"} == 0
   for: 1m
   labels:
     severity: critical
 
-# 全部 endpoint 都不可用（整個叢集掛了）
+# All endpoints are unavailable (entire cluster is down)
 - alert: MariaDBAllEndpointsDown
   expr: kube_endpoint_address_available{endpoint=~"<name>"} == 0
   for: 1m
@@ -166,26 +158,16 @@ Primary Service Endpoint:
 偵測「DB pod 健不健康」。比 endpoint 更早反映問題。
 
 ```yaml
-# Primary pod NotReady（可能觸發 failover）
+# Primary pod NotReady (may trigger failover)
 - alert: MariaDBPrimaryPodNotReady
-  expr: |
-    kube_pod_status_ready{
-      pod=~"mariadb-chaos-.*",
-      condition="true"
-    } == 0
+  expr: kube_pod_status_ready{pod=~"mariadb-chaos-.*", condition="true"} == 0
   for: 30s
   labels:
     severity: warning
 
-# 多個 pod 同時 NotReady
+# Multiple pods NotReady at the same time
 - alert: MariaDBMultiplePodsNotReady
-  expr: |
-    count(
-      kube_pod_status_ready{
-        pod=~"mariadb-chaos-.*",
-        condition="true"
-      } == 0
-    ) >= 2
+  expr: count(kube_pod_status_ready{pod=~"mariadb-chaos-.*", condition="true"} == 0) >= 2
   for: 1m
   labels:
     severity: critical
@@ -208,13 +190,9 @@ kubectl --context=kind-mdb -n default get mdb mariadb-chaos \
 如果 operator 有輸出 metrics（如 `mariadb_operator_status`），可以建 alert：
 
 ```yaml
-# 僅在 operator 輸出 metrics 時可用
+# Only available when operator exports metrics
 - alert: MariaDBCRNotReady
-  expr: |
-    mariadb_operator_mariadb_condition{
-      condition="Ready",
-      status="True"
-    } == 0
+  expr: mariadb_operator_mariadb_condition{condition="Ready", status="True"} == 0
   for: 2m
   labels:
     severity: critical
@@ -270,24 +248,20 @@ kubectl --context=kind-mdb -n default get mdb mariadb-chaos \
 **Alert 建議**：
 
 ```yaml
-# 用 for: 1m 過濾正常 switchover
-# 如果超過 1 分鐘 Primary endpoint 仍為 0 → 真的有問題
+# Use for: 1m to filter out normal switchover
+# If Primary endpoint remains 0 for over 1 minute, something is wrong
 - alert: MariaDBPrimaryEndpointDown
-  for: 1m  # ← 關鍵：給 switchover 時間完成
+  for: 1m  # ← Key: give switchover time to complete
 
-# 用 for: 5m 偵測 switchover 卡住
+# Use for: 5m to detect stuck switchover
 - alert: MariaDBSwitchoverStuck
-  expr: |
-    kube_endpoint_address_available{endpoint=~".*-primary"} == 0
+  expr: kube_endpoint_address_available{endpoint=~".*-primary"} == 0
   for: 5m
   labels:
     severity: critical
   annotations:
-    summary: "MariaDB Primary endpoint 持續不可用超過 5 分鐘"
-    description: |
-      可能 switchover 卡住了。
-      檢查：kubectl get mdb -o jsonpath='{.status.conditions}'
-      參考：concepts/09-switchover.md
+    summary: "MariaDB Primary endpoint has been unavailable for over 5 minutes"
+    description: "Switchover may be stuck. Check: kubectl get mdb -o jsonpath='{.status.conditions}'. Reference: concepts/09-switchover.md"
 ```
 
 ---
