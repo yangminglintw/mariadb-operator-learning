@@ -1191,14 +1191,15 @@ spec:
 # max_used_connections = highest connection count since MariaDB started (high watermark)
 # Key advantage: even if spike completes between two scrapes, the value stays at the peak
 # This is the only metric that can detect spikes in scrape blind spots
+# Uses changes()[10m] to only fire when high watermark is freshly updated, not permanently
 - alert: MariaDBMaxUsedConnectionsHigh
-  expr: mysql_global_status_max_used_connections / mysql_global_variables_max_connections > 0.9
+  expr: mysql_global_status_max_used_connections / mysql_global_variables_max_connections > 0.9 and changes(mysql_global_status_max_used_connections[10m]) > 0
   for: 0m
   labels:
     severity: critical
   annotations:
     summary: "MariaDB max used connections > 90%"
-    description: "{{ $labels.instance }} highest connection count since startup reached {{ $value | printf \"%.0f\" }}% of max_connections. Even if the spike has passed, this high watermark proves it approached the limit. Note: resets on MariaDB restart."
+    description: "{{ $labels.instance }} highest connection count since startup reached {{ $value | printf \"%.0f\" }}% of max_connections. High watermark was updated in the last 10 minutes, indicating a recent spike."
 ```
 
 #### Alert 搭配策略
