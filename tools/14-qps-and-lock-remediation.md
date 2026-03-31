@@ -69,28 +69,128 @@ rate(mysql_global_status_queries[5m]) - rate(mysql_global_status_questions[5m])
 
 **建議**：QPS alert 應該用相對基線，而非絕對值。不同環境的正常 QPS 差異極大。
 
-### Alert Rules
+### 為什麼 QPS Alert 無法通用
+
+QPS alert 使用 `avg_over_time` 基線倍數，在間歇性負載（batch job）下會誤觸發：
+
+```
+Batch job 每天 9am 跑 1 小時（平時 QPS = 0）：
+  1h avg（8:00-9:00）= 0 → job 啟動時 QPS 從 0 暴衝 → 任何倍數都觸發（誤報）
+  1h avg（9:00-10:00）= 200 → job 結束 QPS 降到 0 → drop alert 觸發（誤報）
+```
+
+Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
+**QPS alert 需要 app team 根據自己的流量模式設定門檻**。
+
+### QPS Alert 模板（Optional — 需要 app team 自行設定門檻）
 
 ```yaml
-# QPS spike: client QPS exceeds 1.5x the 1-hour baseline
-- alert: MariaDBQPSSpike
-  expr: rate(mysql_global_status_questions[5m]) > 1.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m])
+# === Optional QPS Alert Templates ===
+# These require app-specific thresholds. App team should uncomment and adjust.
+
+# Template 1: For steady-traffic apps (OLTP, API backends)
+# Adjust 1.5 multiplier and 1h window to match your traffic pattern
+# - alert: MariaDBQPSSpike
+#   expr: rate(mysql_global_status_questions[5m]) > 1.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m])
+#   for: 2m
+#   labels:
+#     severity: info
+#     group_name: user
+#   annotations:
+#     summary: "MariaDB client QPS spike on {{ $labels.namespace }}/{{ $labels.pod }}"
+#     description: "Client QPS exceeds 1.5x the 1-hour average."
+
+# Template 2: For apps that should always have traffic (QPS drop = problem)
+# Only use if your app runs 24/7 with steady traffic
+# - alert: MariaDBQPSDrop
+#   expr: rate(mysql_global_status_questions[5m]) < 0.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m]) and rate(mysql_global_status_questions[5m]) > 0
+#   for: 3m
+#   labels:
+#     severity: info
+#     group_name: user
+#   annotations:
+#     summary: "MariaDB client QPS drop on {{ $labels.namespace }}/{{ $labels.pod }}"
+#     description: "Client QPS dropped below 50% of baseline."
+
+# Template 3: For batch/periodic apps (absolute threshold)
+# Set YOUR_THRESHOLD to your job's max expected QPS
+# - alert: MariaDBQPSHigh
+#   expr: rate(mysql_global_status_questions[5m]) > YOUR_THRESHOLD
+#   for: 5m
+#   labels:
+#     severity: info
+#     group_name: user
+```
+
+### 通用 DB 健康 Alerts（不依賴 app 流量模式）
+
+以下 alert 監控的是 **QPS 造成的影響**，不是 QPS 本身，因此適用於所有 app。
+
+**`threads_running`**：正在執行 SQL 的 thread 數量（不含 idle 連線）。
+不管 app 的 QPS 模式如何，`threads_running` 過高代表 DB 被壓垮。
+
+門檻參考（依 CPU cores）：
+
+| DB 規格 | Cores | warning (> 2x) | critical (> 5x) |
+|---------|:---:|:---:|:---:|
+| Small | 2 | > 4 | > 10 |
+| Medium | 4 | > 8 | > 20 |
+| Large | 8 | > 16 | > 40 |
+
+以下用保守通用值（兼顧所有規格）：
+
+**`group_name` routing 規則**：
+- `group_name: all` → platform + user 都收到
+- `group_name: platform` → 只有 platform team 收到
+- `group_name: user` → 只有 app team 收到
+
+```yaml
+# === Universal DB Health Alerts (no app-specific threshold needed) ===
+
+# Threads running high — both platform and user should know
+- alert: MariaDBThreadsRunningHigh
+  expr: mysql_global_status_threads_running > 10
   for: 2m
   labels:
     severity: warning
+    group_name: all
   annotations:
-    summary: "MariaDB client QPS spike detected"
-    description: "{{ $labels.instance }} client QPS exceeds 1.5x the 1-hour average. Check for app traffic surge or runaway queries."
+    summary: "MariaDB threads running > 10 on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads actively executing queries. DB may be overloaded. Check for slow queries or missing indexes."
 
-# QPS drop: sudden drop may indicate app connection failure or upstream issue
-- alert: MariaDBQPSDrop
-  expr: rate(mysql_global_status_questions[5m]) < 0.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m]) and rate(mysql_global_status_questions[5m]) > 0
-  for: 3m
+# Threads running critical — platform infrastructure decision
+- alert: MariaDBThreadsRunningCritical
+  expr: mysql_global_status_threads_running > 30
+  for: 1m
   labels:
     severity: warning
+    group_name: platform
   annotations:
-    summary: "MariaDB client QPS dropped below 50% of baseline"
-    description: "{{ $labels.instance }} client QPS dropped significantly. Check app connectivity and upstream services."
+    summary: "MariaDB threads running > 30 on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads actively executing queries. Severe overload, may need resource scaling or rate limiting."
+
+# Slow queries increasing — user app issue
+- alert: MariaDBSlowQueriesSpike
+  expr: rate(mysql_global_status_slow_queries[5m]) > 0.5
+  for: 2m
+  labels:
+    severity: info
+    group_name: user
+  annotations:
+    summary: "MariaDB slow queries increasing on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} is generating {{ $value | printf \"%.1f\" }} slow queries/sec. Check slow query log for missing indexes or lock contention."
+
+# Container CPU throttling — platform resource limit issue
+# sum by removes per-cpu-core duplicates, excludes node label to survive pod rescheduling
+- alert: MariaDBCPUThrottlingHigh
+  expr: sum by (namespace, pod, container) (rate(container_cpu_cfs_throttled_seconds_total{container="mariadb"}[5m])) > 0.25
+  for: 5m
+  labels:
+    severity: warning
+    group_name: platform
+  annotations:
+    summary: "MariaDB container CPU throttling on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} is being CPU throttled. Consider increasing CPU limits."
 ```
 
 ---
@@ -130,8 +230,8 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
   labels:
     severity: warning
   annotations:
-    summary: "Sustained row lock contention on {{ $labels.instance }}"
-    description: "{{ $labels.instance }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL. See 11-row-lock-diagnosis.md."
+    summary: "Sustained row lock contention on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL. See 11-row-lock-diagnosis.md."
 
 # Row lock wait frequency spike (more than 10 new waits in 5 minutes)
 - alert: MariaDBRowLockWaitSpike
@@ -140,8 +240,8 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
   labels:
     severity: warning
   annotations:
-    summary: "Row lock wait spike on {{ $labels.instance }}"
-    description: "{{ $labels.instance }} had {{ $value | printf \"%.0f\" }} new row lock waits in the last 5 minutes. Possible batch job or hot-row contention."
+    summary: "Row lock wait spike on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} had {{ $value | printf \"%.0f\" }} new row lock waits in the last 5 minutes. Possible batch job or hot-row contention."
 
 # Average lock wait time too high (over 5 seconds)
 - alert: MariaDBRowLockTimeHigh
@@ -150,8 +250,8 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
   labels:
     severity: critical
   annotations:
-    summary: "Average row lock wait time exceeds 5s on {{ $labels.instance }}"
-    description: "{{ $labels.instance }} average row lock wait is {{ $value }}ms. Transactions are being significantly delayed. Immediate investigation needed."
+    summary: "Average row lock wait time exceeds 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} average row lock wait is {{ $value }}ms. Transactions are being significantly delayed. Immediate investigation needed."
 
 # Severe contention: many threads blocked simultaneously
 - alert: MariaDBRowLockSevere
@@ -160,8 +260,8 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
   labels:
     severity: critical
   annotations:
-    summary: "Severe row lock contention on {{ $labels.instance }}"
-    description: "{{ $labels.instance }} has {{ $value }} threads waiting for row locks. This may cause cascading timeouts and app errors."
+    summary: "Severe row lock contention on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks. This may cause cascading timeouts and app errors."
 ```
 
 ### 與 `11-row-lock-diagnosis.md` 的關係
@@ -321,11 +421,23 @@ KILL CONNECTION 123;  → 斷開 thread 123 的整個連線
 
 ## 四、Alert 總覽
 
-| Alert | 偵測什麼 | for | Severity |
-|-------|---------|-----|----------|
-| MariaDBQPSSpike | Client QPS 超過基線 1.5 倍 | 2m | warning |
-| MariaDBQPSDrop | Client QPS 跌到基線的 50% 以下 | 3m | warning |
-| MariaDBRowLockContention | 持續 3+ 個 thread 等待 row lock | 2m | warning |
-| MariaDBRowLockWaitSpike | 5 分鐘內 lock wait 增加 > 10 次 | 0m | warning |
-| MariaDBRowLockTimeHigh | 平均 lock wait 時間 > 5 秒 | 1m | critical |
-| MariaDBRowLockSevere | 10+ 個 thread 同時等待 row lock | 30s | critical |
+### 通用 DB 健康 Alerts（Platform 預設提供）
+
+| Alert | 偵測什麼 | for | Severity | group_name |
+|-------|---------|-----|----------|------------|
+| MariaDBThreadsRunningHigh | threads_running > 10 | 2m | warning | all |
+| MariaDBThreadsRunningCritical | threads_running > 30 | 1m | warning | platform |
+| MariaDBSlowQueriesSpike | slow queries > 0.5/s | 2m | info | user |
+| MariaDBCPUThrottlingHigh | CPU throttle > 25% | 5m | warning | platform |
+| MariaDBRowLockContention | 持續 3+ 個 thread 等待 row lock | 2m | warning | all |
+| MariaDBRowLockWaitSpike | 5 分鐘內 lock wait 增加 > 10 次 | 0m | warning | all |
+| MariaDBRowLockTimeHigh | 平均 lock wait 時間 > 5 秒 | 1m | critical | all |
+| MariaDBRowLockSevere | 10+ 個 thread 同時等待 row lock | 30s | critical | platform |
+
+### QPS Alerts（Optional — App team 自行啟用）
+
+| Alert | 偵測什麼 | 適用情境 |
+|-------|---------|---------|
+| MariaDBQPSSpike | Client QPS > 1.5x 基線 | 穩定流量的 OLTP/API app |
+| MariaDBQPSDrop | Client QPS < 0.5x 基線 | 24/7 持續有流量的 app |
+| MariaDBQPSHigh | Client QPS > 固定門檻 | Batch/periodic job app |
