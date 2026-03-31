@@ -1221,7 +1221,7 @@ spec:
   expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.95
   for: 0m
   labels:
-    severity: critical
+    severity: info
   annotations:
     summary: "MariaDB connection spike > 95%"
     description: "{{ $labels.instance }} connection usage is {{ $value | printf \"%.1f\" }}%. Connections approaching max_connections, may trigger probe failure and failover. Check for app connection surge immediately."
@@ -1230,7 +1230,7 @@ spec:
 # 3 approaches below, choose the best fit for your environment (uncomment to use)
 #
 # Approach A: Baseline multiplier (auto-adapts to different specs)
-#   Normal 40, 1.1x = 44 triggers, more sensitive than 2x threshold
+#   Normal 40, 2x = 80 triggers, filters normal fluctuations
 #   + Must exceed 50% max to avoid low-baseline false positives
 #
 # Approach B: Peak in last 2 minutes (catches any scrape high point)
@@ -1241,15 +1241,15 @@ spec:
 #   Uses deriv() to detect connection count rise rate
 #   Best when spike has a rising phase (not instant jump to max)
 
-# --- Approach A: Baseline 1.1x + 50% max ---
+# --- Approach A: Baseline 2x + 50% max ---
 - alert: MariaDBConnectionSurge
-  expr: (mysql_global_status_threads_connected > 1.1 * avg_over_time(mysql_global_status_threads_connected[1h])) and (mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.5)
+  expr: (mysql_global_status_threads_connected > 2 * avg_over_time(mysql_global_status_threads_connected[1h])) and (mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.5)
   for: 0m
   labels:
-    severity: warning
+    severity: info
   annotations:
     summary: "MariaDB connection count surge"
-    description: "{{ $labels.instance }} current connections exceed 1.1x the 1-hour average and over 50% of max_connections."
+    description: "{{ $labels.instance }} current connections exceed 2x the 1-hour average and over 50% of max_connections."
 
 # --- Approach B: Peak in 5 minutes > 70% max ---
 # 5-minute window covers spikes lasting over 2 minutes
@@ -1257,7 +1257,7 @@ spec:
   expr: max_over_time(mysql_global_status_threads_connected[5m]) / mysql_global_variables_max_connections > 0.7
   for: 0m
   labels:
-    severity: warning
+    severity: info
   annotations:
     summary: "MariaDB connection peak > 70% in 5 minutes"
     description: "{{ $labels.instance }} connection peak reached {{ $value | printf \"%.0f\" }}% of max_connections in the last 5 minutes."
@@ -1273,7 +1273,7 @@ spec:
   expr: deriv(mysql_global_status_threads_connected[5m]) > 0.03 and mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.5
   for: 0m
   labels:
-    severity: warning
+    severity: info
   annotations:
     summary: "MariaDB connections rising rapidly"
     description: "{{ $labels.instance }} connections are growing rapidly (+{{ $value | printf \"%.1f\" }}/sec) and exceed 50% of max_connections."
@@ -1285,7 +1285,7 @@ spec:
   expr: increase(mysql_global_status_connection_errors_max_connections[5m]) > 0
   for: 0m
   labels:
-    severity: critical
+    severity: info
   annotations:
     summary: "MariaDB max_connections refused detected"
     description: "{{ $labels.instance }} had connections refused due to max_connections in the last 5 minutes. Even if the spike has passed, this counter proves max_connections was reached."
@@ -1299,7 +1299,7 @@ spec:
   expr: mysql_global_status_max_used_connections / mysql_global_variables_max_connections > 0.9 and changes(mysql_global_status_max_used_connections[60m]) > 0
   for: 0m
   labels:
-    severity: critical
+    severity: info
   annotations:
     summary: "MariaDB max used connections > 90%"
     description: "{{ $labels.instance }} highest connection count since startup reached {{ $value | printf \"%.0f\" }}% of max_connections. High watermark was updated in the last 60 minutes, indicating a recent spike."
@@ -1310,12 +1310,12 @@ spec:
 | Alert | 偵測時機 | 能抓到 scrape 盲區的 spike？ | Severity |
 |-------|---------|------|----------|
 | 現有 0.75/0.80/0.85 + for | 緩慢增長 | ✗ for 來不及 | warning |
-| Alert 1: **ConnectionSpike** | spike 瞬間 | △ 如果 scrape 恰好抓到 | critical |
-| Alert 2a: **ConnectionSurge** | spike 上升（> 1.1× 基線 + > 50% max） | △ 如果 scrape 抓到 | warning |
-| Alert 2b: **ConnectionPeak** | 5 分鐘內峰值 > 70% max | △ 如果 scrape 抓到 | warning |
-| Alert 2c: **ConnectionRising** ★ | 5 分鐘斜率 > 0.03/s + > 50% max | △ 如果 scrape 抓到（實測效果最佳，無誤報） | warning |
-| Alert 3: **ConnectionErrors** | spike 之後 | △ 如果 counter 被 scrape 到 | critical |
-| Alert 4: **MaxUsedConnHigh** ★ | **啟動以來** | **✓ 高水位不會降，下次 scrape 一定看到** | critical |
+| Alert 1: **ConnectionSpike** | spike 瞬間 | △ 如果 scrape 恰好抓到 | info |
+| Alert 2a: **ConnectionSurge** | spike 上升（> 2× 基線 + > 50% max） | △ 如果 scrape 抓到 | info |
+| Alert 2b: **ConnectionPeak** | 5 分鐘內峰值 > 70% max | △ 如果 scrape 抓到 | info |
+| Alert 2c: **ConnectionRising** ★ | 5 分鐘斜率 > 0.03/s + > 50% max | △ 如果 scrape 抓到（實測效果最佳，無誤報） | info |
+| Alert 3: **ConnectionErrors** | spike 之後 | △ 如果 counter 被 scrape 到 | info |
+| Alert 4: **MaxUsedConnHigh** ★ | **啟動以來** | **✓ 高水位不會降，下次 scrape 一定看到** | info |
 
 **★ Alert 4 是唯一能可靠偵測 scrape 盲區 spike 的 alert**，因為 `max_used_connections` 是高水位標記，spike 過了也不降。
 
