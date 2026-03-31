@@ -82,44 +82,57 @@ Batch job 每天 9am 跑 1 小時（平時 QPS = 0）：
 Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
 **QPS alert 需要 app team 根據自己的流量模式設定門檻**。
 
-### QPS Alert 模板（Optional — 需要 app team 自行設定門檻）
+### QPS Alert 模板（需要 app team 根據自己的流量模式設定門檻）
+
+#### Template 1: 穩定流量型（OLTP、API backend）
+
+適合 24/7 有持續流量的 app，用基線倍數偵測異常。
 
 ```yaml
-# === Optional QPS Alert Templates ===
-# These require app-specific thresholds. App team should uncomment and adjust.
-
-# Template 1: For steady-traffic apps (OLTP, API backends)
 # Adjust 1.5 multiplier and 1h window to match your traffic pattern
-# - alert: MariaDBQPSSpike
-#   expr: rate(mysql_global_status_questions[5m]) > 1.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m])
-#   for: 2m
-#   labels:
-#     severity: info
-#     group_name: user
-#   annotations:
-#     summary: "MariaDB client QPS spike on {{ $labels.namespace }}/{{ $labels.pod }}"
-#     description: "Client QPS exceeds 1.5x the 1-hour average."
+- alert: MariaDBQPSSpike
+  expr: rate(mysql_global_status_questions[5m]) > 1.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m])
+  for: 2m
+  labels:
+    severity: info
+    group_name: user
+  annotations:
+    summary: "MariaDB client QPS spike on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "Client QPS exceeds 1.5x the 1-hour average."
+```
 
-# Template 2: For apps that should always have traffic (QPS drop = problem)
+#### Template 2: 持續流量型（QPS 掉到 0 = 有問題）
+
+適合 app 應該隨時有流量，QPS 驟降代表 app 連不上或上游掛了。
+
+```yaml
 # Only use if your app runs 24/7 with steady traffic
-# - alert: MariaDBQPSDrop
-#   expr: rate(mysql_global_status_questions[5m]) < 0.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m]) and rate(mysql_global_status_questions[5m]) > 0
-#   for: 3m
-#   labels:
-#     severity: info
-#     group_name: user
-#   annotations:
-#     summary: "MariaDB client QPS drop on {{ $labels.namespace }}/{{ $labels.pod }}"
-#     description: "Client QPS dropped below 50% of baseline."
+- alert: MariaDBQPSDrop
+  expr: rate(mysql_global_status_questions[5m]) < 0.5 * avg_over_time(rate(mysql_global_status_questions[5m])[1h:1m]) and rate(mysql_global_status_questions[5m]) > 0
+  for: 3m
+  labels:
+    severity: info
+    group_name: user
+  annotations:
+    summary: "MariaDB client QPS drop on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "Client QPS dropped below 50% of baseline."
+```
 
-# Template 3: For batch/periodic apps (absolute threshold)
-# Set YOUR_THRESHOLD to your job's max expected QPS
-# - alert: MariaDBQPSHigh
-#   expr: rate(mysql_global_status_questions[5m]) > YOUR_THRESHOLD
-#   for: 5m
-#   labels:
-#     severity: info
-#     group_name: user
+#### Template 3: 間歇/批次型（batch job、periodic task）
+
+適合平時 QPS ≈ 0、只在特定時間有流量的 app，用絕對門檻。
+
+```yaml
+# Set threshold to your job's max expected QPS
+- alert: MariaDBQPSHigh
+  expr: rate(mysql_global_status_questions[5m]) > 500
+  for: 5m
+  labels:
+    severity: info
+    group_name: user
+  annotations:
+    summary: "MariaDB client QPS high on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "Client QPS exceeds expected threshold."
 ```
 
 ### 通用 DB 健康 Alerts（不依賴 app 流量模式）
