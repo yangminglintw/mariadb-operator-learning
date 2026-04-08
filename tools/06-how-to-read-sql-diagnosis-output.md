@@ -171,3 +171,65 @@ Role: Replica
 - 實際掃描了多少行（`rows_examined`）
 - SQL 的執行效率（`rows_examined` vs `rows_sent`）
 - 每個 pod 的執行狀況
+
+### Q: 什麼是 Digest？為什麼我看到的 SQL 參數都變成 `?`？
+
+**A:** MariaDB 收到每條 SQL 後會做正規化（normalize）：移除參數值、統一大小寫、移除多餘空白，產生一個 **DIGEST_TEXT**（SQL 模板），再對它做 hash 產生 **DIGEST**（固定長度的指紋）。
+
+```
+原始 SQL:    SELECT * FROM orders WHERE id = 12345 AND status = 'active'
+DIGEST_TEXT: SELECT * FROM `orders` WHERE `id` = ? AND `status` = ?
+DIGEST:      abc123def456...（hash 值）
+```
+
+所有只差在參數值的 SQL 會得到同一個 DIGEST，這讓 MariaDB 可以聚合統計（同一類 SQL 執行了幾次、多慢）。
+
+### Q: 我想看完整 SQL（含實際參數），要去哪裡找？
+
+**A:** Performance Schema 有三層表，保留的內容不同：
+
+| 表 | 有完整 SQL？ | 保留量 | 說明 |
+|----|:---:|--------|------|
+| `events_statements_history` | ✓ `SQL_TEXT` | 每 thread 最近 10 筆 | 最新的，最先被覆蓋 |
+| `events_statements_history_long` | ✓ `SQL_TEXT` | 全域最近 10000 筆 | 多一些，但也會被淘汰 |
+| `events_statements_summary_by_digest` | ✗ 只有 `DIGEST_TEXT` | 永久（直到重啟） | 只有模板（`?`），沒有實際參數 |
+
+查詢方式：
+
+```sql
+-- 從 history 查完整 SQL（最近的）
+SELECT SQL_TEXT, CURRENT_SCHEMA, ROWS_EXAMINED
+FROM performance_schema.events_statements_history
+WHERE DIGEST = '<your_digest>'
+ORDER BY EVENT_ID DESC LIMIT 1;
+
+-- 如果 history 沒有，查 history_long
+SELECT SQL_TEXT, CURRENT_SCHEMA, ROWS_EXAMINED
+FROM performance_schema.events_statements_history_long
+WHERE DIGEST = '<your_digest>'
+ORDER BY EVENT_ID DESC LIMIT 1;
+```
+
+### Q: 為什麼 history 裡找不到完整 SQL？
+
+**A:** `history` 和 `history_long` 是滾動式的 buffer — 新的 SQL 會覆蓋舊的。這是 MariaDB 的設計，**不是系統問題，也不需要調整**。
+
+完整 SQL 本來就不是設計來永久保存的。Digest 的用途是**聚合統計**（同一類 SQL 的效能趨勢），不是記錄每一次執行的參數。
+
+**你能做的：**
+- 拿到 `DIGEST_TEXT`（模板）就足以判斷效能問題 — 因為 `?` 的位置就是你的 WHERE 條件，加 index 看的是欄位不是參數值
+- 如果真的需要看實際參數，讓 app 再跑一次同樣的操作，**然後立刻查 history**（趁還沒被覆蓋）
+- App 端的 log 或 ORM debug mode 也能看到完整 SQL，不需要從 DB 端取
+
+### Q: `DIGEST_TEXT` 中的 `?` 可以還原成實際值嗎？
+
+**A:** 不行。正規化是單向的，`?` 無法還原。
+
+但**大多數情況不需要實際參數值**：
+
+| 你想做的事 | 需要實際參數嗎 | 用什麼 |
+|-----------|:---:|--------|
+| 判斷要不要加 index | ✗ | `DIGEST_TEXT` — 看 WHERE 的欄位就夠了 |
+| 分析 query 效能 | ✗ | `summary_by_digest` — 有執行次數、掃描行數、耗時 |
+| 用 EXPLAIN 分析 | △ | 用任意參數值代入 `?` 即可，結果一樣 |
+| Debug 特定資料問題 | ✓ | 從 app log 或 ORM debug mode 取得 |
