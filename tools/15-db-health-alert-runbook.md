@@ -258,7 +258,7 @@ kubectl --context=<CTX> -n <NS> exec <POD> -c mariadb -- \
 
 | 項目 | 內容 |
 |------|------|
-| **觸發條件** | `increase(mysql_global_status_innodb_row_lock_waits_total[5m]) > 10` |
+| **觸發條件** | `increase(mysql_global_status_innodb_row_lock_waits[5m]) > 3 * avg_over_time(...[7d:5m] offset 1d) + 10`（最近 5 分鐘 > 7 天 baseline × 3）|
 | **緊急度** | 低 |
 | **group_name** | all |
 
@@ -283,7 +283,7 @@ kubectl --context=<CTX> -n <NS> exec <POD> -c mariadb -- \
 
 | 項目 | 內容 |
 |------|------|
-| **觸發條件** | `mysql_global_status_innodb_row_lock_time_avg > 5000` 持續 1 分鐘 |
+| **觸發條件** | `increase(row_lock_time[5m]) / clamp_min(increase(row_lock_waits[5m]), 1) > 5000` 持續 1 分鐘（最近 5 分鐘平均 lock wait > 5s）|
 | **緊急度** | 高 |
 | **group_name** | all |
 
