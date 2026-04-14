@@ -447,7 +447,7 @@ KILL CONNECTION 123;  → 斷開 thread 123 的整個連線
 | MariaDBCPUThrottlingHigh | CPU throttle > 25% | 5m | warning | platform |
 | MariaDBRowLockContention | 持續 3+ 個 thread 等待 row lock | 2m | warning | all |
 | MariaDBRowLockWaitSpike | 5 分鐘內 lock wait 增加 > 10 次 | 0m | warning | all |
-| MariaDBRowLockTimeHigh | 平均 lock wait 時間 > 5 秒 | 1m | critical | all |
+| MariaDBRowLockTimeHigh | 最近 5 分鐘平均 lock wait 時間 > 5 秒 | 1m | critical | all |
 | MariaDBRowLockSevere | 10+ 個 thread 同時等待 row lock | 30s | critical | platform |
 
 ### QPS Alerts（Optional — App team 自行啟用）
