@@ -402,6 +402,143 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
   mariadb -u root -p"${MYSQL_PWD}" -e "KILL 12"
 ```
 
+### 自動化 — 用腳本定期殺 blocking
+
+#### 適用場景
+
+- 已知某些長 transaction 會卡住其他 query（例如報表 job 忘記 commit）
+- 希望在 blocking 超過一定時間後自動處理，減少人工介入
+- **注意**：自動 KILL 是高風險操作，務必理解安全機制後再啟用
+
+#### kill_blocking_trx.sh
+
+```bash
+#!/bin/bash
+# kill_blocking_trx.sh — 自動殺 blocking 超過指定時間的 transaction
+#
+# 用法：
+#   bash kill_blocking_trx.sh
+#
+# 環境變數（可在 crontab 或 script 前設定）：
+#   KUBE_CONTEXT   — kubectl context（預設 kind-mdb）
+#   NAMESPACE      — namespace（預設 default）
+#   POD_NAME       — MariaDB pod 名稱（預設 mariadb-chaos-0）
+#   CONTAINER      — container 名稱（預設 mariadb）
+#   MAX_BLOCK_SEC  — blocking 超過幾秒才殺（預設 300）
+
+set -euo pipefail
+
+KUBE_CONTEXT="${KUBE_CONTEXT:-kind-mdb}"
+NAMESPACE="${NAMESPACE:-default}"
+POD_NAME="${POD_NAME:-mariadb-chaos-0}"
+CONTAINER="${CONTAINER:-mariadb}"
+MAX_BLOCK_SEC="${MAX_BLOCK_SEC:-300}"
+MYSQL_PWD=$(kubectl --context="${KUBE_CONTEXT}" -n "${NAMESPACE}" \
+  exec "${POD_NAME}" -c "${CONTAINER}" -- printenv MARIADB_ROOT_PASSWORD 2>/dev/null)
+
+LOG_PREFIX="[$(date '+%Y-%m-%d %H:%M:%S')] kill_blocking_trx:"
+
+# --- Step 1: 找出 blocking 超過 MAX_BLOCK_SEC 的 thread ---
+FIND_SQL="
+SELECT DISTINCT b.trx_mysql_thread_id,
+       TIMESTAMPDIFF(SECOND, b.trx_started, NOW()) AS blocking_sec,
+       b.trx_query AS blocking_query
+FROM information_schema.innodb_lock_waits lw
+JOIN information_schema.innodb_trx b ON b.trx_id = lw.blocking_trx_id
+JOIN information_schema.innodb_trx r ON r.trx_id = lw.requesting_trx_id
+WHERE b.trx_mysql_thread_id > 10
+  AND TIMESTAMPDIFF(SECOND, b.trx_started, NOW()) > ${MAX_BLOCK_SEC}
+ORDER BY blocking_sec DESC;
+"
+
+RESULT=$(kubectl --context="${KUBE_CONTEXT}" -n "${NAMESPACE}" \
+  exec "${POD_NAME}" -c "${CONTAINER}" -- \
+  bash -c "MYSQL_PWD='${MYSQL_PWD}' mysql -u root -sN -e \"${FIND_SQL}\"" 2>/dev/null || true)
+
+if [ -z "${RESULT}" ]; then
+  echo "${LOG_PREFIX} No blocking transactions exceeding ${MAX_BLOCK_SEC}s"
+  exit 0
+fi
+
+echo "${LOG_PREFIX} Found blocking transactions:"
+echo "${RESULT}"
+
+# --- Step 2: 逐一 KILL ---
+echo "${RESULT}" | while IFS=$'\t' read -r THREAD_ID BLOCK_SEC BLOCK_QUERY; do
+  # 安全檢查：跳過 thread_id < 10（系統/複製 thread）
+  if [ "${THREAD_ID}" -le 10 ] 2>/dev/null; then
+    echo "${LOG_PREFIX} SKIP thread ${THREAD_ID} (system/replication thread)"
+    continue
+  fi
+
+  echo "${LOG_PREFIX} KILLING thread ${THREAD_ID} (blocking ${BLOCK_SEC}s, query: ${BLOCK_QUERY:-<idle>})"
+
+  # 先嘗試 KILL QUERY（只取消當前語句，不斷連線）
+  kubectl --context="${KUBE_CONTEXT}" -n "${NAMESPACE}" \
+    exec "${POD_NAME}" -c "${CONTAINER}" -- \
+    bash -c "MYSQL_PWD='${MYSQL_PWD}' mysql -u root -e 'KILL QUERY ${THREAD_ID};'" 2>/dev/null || true
+
+  sleep 2
+
+  # 檢查是否仍在 blocking
+  STILL_BLOCKING=$(kubectl --context="${KUBE_CONTEXT}" -n "${NAMESPACE}" \
+    exec "${POD_NAME}" -c "${CONTAINER}" -- \
+    bash -c "MYSQL_PWD='${MYSQL_PWD}' mysql -u root -sN -e \"
+      SELECT COUNT(*) FROM information_schema.innodb_lock_waits lw
+      JOIN information_schema.innodb_trx b ON b.trx_id = lw.blocking_trx_id
+      WHERE b.trx_mysql_thread_id = ${THREAD_ID};\"" 2>/dev/null || echo "0")
+
+  if [ "${STILL_BLOCKING}" -gt 0 ] 2>/dev/null; then
+    echo "${LOG_PREFIX} Thread ${THREAD_ID} still blocking, executing KILL CONNECTION"
+    kubectl --context="${KUBE_CONTEXT}" -n "${NAMESPACE}" \
+      exec "${POD_NAME}" -c "${CONTAINER}" -- \
+      bash -c "MYSQL_PWD='${MYSQL_PWD}' mysql -u root -e 'KILL CONNECTION ${THREAD_ID};'" 2>/dev/null || true
+  else
+    echo "${LOG_PREFIX} Thread ${THREAD_ID} resolved after KILL QUERY"
+  fi
+done
+
+echo "${LOG_PREFIX} Done"
+```
+
+#### Crontab 設定
+
+```bash
+# 每 5 分鐘檢查一次，殺 blocking 超過 300 秒的 transaction
+*/5 * * * * /path/to/kill_blocking_trx.sh >> /var/log/kill_blocking_trx.log 2>&1
+```
+
+#### 安全注意事項
+
+| 項目 | 說明 |
+|------|------|
+| **thread_id > 10** | 跳過系統和複製 thread，避免殺掉 replication |
+| **blocking > 300 秒** | 只殺長時間 blocking 的 transaction，短暫 lock 不處理 |
+| **先 KILL QUERY** | 只取消當前語句，讓連線繼續存在（對 App 衝擊最小） |
+| **再 KILL CONNECTION** | 如果 KILL QUERY 無效（例如 idle transaction 沒有 running query），才斷連線 |
+| **Log 記錄** | 每次 KILL 都記錄 thread ID、blocking 時間、query 內容，方便事後追溯 |
+| **不殺 waiting thread** | 只殺 **blocker**（持有 lock 的人），不殺 waiter（等待的人） |
+
+#### KILL QUERY vs KILL CONNECTION
+
+```
+KILL QUERY 123;       → 取消 thread 123 當前正在執行的 SQL
+                        連線保持，App 可以重試
+                        適合：blocking query 正在 running
+
+KILL CONNECTION 123;  → 斷開 thread 123 的整個連線
+                        App 的連線被強制關閉，需要重連
+                        適合：idle transaction（沒有 running query，但持有 lock）
+```
+
+#### 調整建議
+
+| 參數 | 預設值 | 調整建議 |
+|------|--------|---------|
+| `MAX_BLOCK_SEC` | 300（5 分鐘） | 如果是 OLTP 系統，可降到 60-120 秒 |
+| crontab 頻率 | `*/5`（每 5 分鐘） | 配合 `MAX_BLOCK_SEC` 調整，確保不會漏掉 |
+| `thread_id > 10` | 10 | 如果有特殊系統 thread，可以調高 |
+
 ---
 
 ## 七、Deadlock 分析
@@ -739,12 +876,90 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
 
 **Step 4**：如果 alert 已 resolved（lock 已結束）→ 第十節事後追溯
 
-### 對應的 Alert
+### 各 metric 的語意與使用時機
 
-Alert 的正式定義在 [`14-qps-and-lock-remediation.md`](14-qps-and-lock-remediation.md) 第二節。
-本文件定位是**診斷 runbook**，不重複定義 alert。
+| Metric | 類型 | 累積規則 | 適合的 alert 寫法 |
+|---|---|---|---|
+| `Innodb_row_lock_waits` | Counter | 發生一次 lock wait +1，**不管等多久** | `increase([5m])` 配 baseline-relative |
+| `Innodb_row_lock_time` | Counter | 每次 lock wait 的等待毫秒數累加 | 搭配 `waits` 算 5 分鐘平均 |
+| `Innodb_row_lock_time_avg` | Counter-derived | `time / waits`（自啟動累積）| ⚠️ **不要直接用**，會被歷史事件 pin 住 |
+| `Innodb_row_lock_time_max` | Gauge-ish | 最久的那次 lock wait（啟動以來）| 限制同上 |
+| `Innodb_row_lock_current_waits` | Gauge | 現在有幾個 transaction 在等 | 直接 `> N` |
 
-主要對應 alert：
+#### 關鍵觀念
+
+1. **Counter 都是累積值**：只會增加，MySQL restart 才歸零。正常運行幾分鐘就會 > 0，**值本身沒意義**，要看變化率（`rate()` / `increase()`）。
+
+2. **Waits 不等於 Time**：一個等 1ms 和一個等 10 秒，在 `Innodb_row_lock_waits` 都只是 +1。兩者要搭配才看得出「lock 頻率」和「lock 時長」。
+
+3. **`_avg` 是陷阱**：`time_avg` 是從啟動累積的平均，一次歷史 long lock 會永遠 pin 住這個值。必須自己用 `increase(time[5m]) / increase(waits[5m])` 算時間窗口內的平均。
+
+4. **Current_waits 是即時 gauge**：是少數可以直接當 alert 用的 metric（`> 0` 太敏感，建議 `> 3 for 2m` 避免短暫 lock 誤報）。
+
+### 為什麼 `innodb_row_lock_current_waits > 0` 太敏感
+
+在任何有併發寫入的系統中，**短暫的 row lock wait 是完全正常的**：
+
+```
+Transaction A: UPDATE orders SET status='done' WHERE id=5;  ← 持有 X lock
+Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock（正常！）
+                                                                 等 0.001 秒後 A commit
+                                                                 B 立刻取得 lock ✓
+```
+
+`> 0` 會在這種正常情境下不斷觸發，造成 alert 疲勞。
+
+### 什麼時候才是真正的問題
+
+| 情境 | 特徵 | 嚴重度 |
+|------|------|--------|
+| 正常短暫 lock | `current_waits` 瞬間 > 0，幾秒內歸零 | 無需 alert |
+| 持續性競爭 | `current_waits` 持續 > 3 超過 2 分鐘 | warning |
+| Lock wait 暴增 | 最近 5 分鐘超過 7 天 baseline × 3 | warning |
+| 長時間等待 | 最近 5 分鐘平均等待時間 > 5 秒 | critical |
+| 大量 thread 被阻塞 | `current_waits` > 10 | critical |
+
+### Alert Rules
+
+```yaml
+- alert: MariaDBRowLockContention
+  expr: mysql_global_status_innodb_row_lock_current_waits > 3
+  for: 2m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Sustained row lock contention on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL."
+
+- alert: MariaDBRowLockWaitSpike
+  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10
+  for: 5m
+  labels:
+    severity: warning
+  annotations:
+    summary: "Row lock wait anomaly on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} row lock waits in last 5m exceeds 3x its 7-day baseline (excl. last 24h). Current: {{ $value | printf \"%.1f\" }}."
+
+- alert: MariaDBRowLockTimeHigh
+  expr: increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 5000
+  for: 1m
+  labels:
+    severity: critical
+  annotations:
+    summary: "Recent avg row lock wait > 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} average row lock wait in the last 5 minutes is {{ $value }}ms. Transactions are being significantly delayed."
+
+- alert: MariaDBRowLockSevere
+  expr: mysql_global_status_innodb_row_lock_current_waits > 10
+  for: 30s
+  labels:
+    severity: critical
+  annotations:
+    summary: "Severe row lock contention on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks. This may cause cascading timeouts and app errors."
+```
+
+### Alert → 診斷對應
 
 | Alert | 對應處理 |
 |---|---|
