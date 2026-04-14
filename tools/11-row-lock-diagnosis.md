@@ -760,13 +760,22 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
   annotations:
     summary: "Row lock wait spike on {{ $labels.instance }}"
 
-# 平均 lock wait 時間過高
+# 最近 5 分鐘的平均 lock wait 時間過高
+# 注意：不要直接用 mysql_global_status_innodb_row_lock_time_avg
+# 該 metric 是從 MySQL 啟動累積的平均，一次歷史 long lock 會 pin 住數值直到
+# MySQL restart 或有足夠多的 short lock 稀釋平均。必須自己用 increase() 算
+# 時間窗口內的平均才會即時。
 - alert: MariaDBRowLockTimeHigh
-  expr: mysql_global_status_innodb_row_lock_time_avg > 5000
+  expr: |
+    increase(mysql_global_status_innodb_row_lock_time_total[5m])
+    / clamp_min(increase(mysql_global_status_innodb_row_lock_waits_total[5m]), 1)
+    > 5000
+  for: 1m
   labels:
     severity: critical
   annotations:
-    summary: "Average row lock wait > 5s on {{ $labels.instance }}"
+    summary: "Recent avg row lock wait > 5s on {{ $labels.instance }}"
+    runbook: "See §3 Query 1 for diagnosis"
 ```
 
 ---
