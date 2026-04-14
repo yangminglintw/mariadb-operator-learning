@@ -749,7 +749,7 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
   labels:
     severity: info
   annotations:
-    summary: "Row lock wait detected on {{ $labels.instance }}"
+    summary: "Row lock wait detected on {{ $labels.namespace }}/{{ $labels.pod }}"
     runbook: "執行 check_row_locks.sh 或第三節 Query 1 找出 blocking SQL"
 
 # lock wait 次數快速增長（5 分鐘內增加 > 10 次）
@@ -758,7 +758,7 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
   labels:
     severity: info
   annotations:
-    summary: "Row lock wait spike on {{ $labels.instance }}"
+    summary: "Row lock wait spike on {{ $labels.namespace }}/{{ $labels.pod }}"
 
 # 最近 5 分鐘的平均 lock wait 時間過高
 # 注意：不要直接用 mysql_global_status_innodb_row_lock_time_avg
@@ -771,7 +771,7 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
   labels:
     severity: info
   annotations:
-    summary: "Recent avg row lock wait > 5s on {{ $labels.instance }}"
+    summary: "Recent avg row lock wait > 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
 ```
 
 ---
