@@ -246,13 +246,13 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
     description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL. See 11-row-lock-diagnosis.md."
 
 - alert: MariaDBRowLockWaitSpike
-  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 10
-  for: 0m
+  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10
+  for: 5m
   labels:
     severity: warning
   annotations:
-    summary: "Row lock wait spike on {{ $labels.namespace }}/{{ $labels.pod }}"
-    description: "{{ $labels.namespace }}/{{ $labels.pod }} had {{ $value | printf \"%.0f\" }} new row lock waits in the last 5 minutes. Possible batch job or hot-row contention."
+    summary: "Row lock wait anomaly on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} row lock waits in last 5m exceeds 3x its 7-day baseline (excl. last 24h). Current: {{ $value | printf \"%.1f\" }}."
 
 - alert: MariaDBRowLockTimeHigh
   expr: increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 5000
@@ -439,7 +439,7 @@ KILL CONNECTION 123;  → 斷開 thread 123 的整個連線
 | MariaDBSlowQueriesSpike | slow queries > 0.5/s | 2m | info | user |
 | MariaDBCPUThrottlingHigh | CPU throttle > 25% | 5m | warning | platform |
 | MariaDBRowLockContention | 持續 3+ 個 thread 等待 row lock | 2m | warning | all |
-| MariaDBRowLockWaitSpike | 5 分鐘內 lock wait 增加 > 10 次 | 0m | warning | all |
+| MariaDBRowLockWaitSpike | 最近 5 分鐘 lock wait 超過 7 天 baseline × 3 | 5m | warning | all |
 | MariaDBRowLockTimeHigh | 最近 5 分鐘平均 lock wait 時間 > 5 秒 | 1m | critical | all |
 | MariaDBRowLockSevere | 10+ 個 thread 同時等待 row lock | 30s | critical | platform |
 
