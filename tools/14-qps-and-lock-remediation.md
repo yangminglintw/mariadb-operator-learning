@@ -248,7 +248,7 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
 
 # Row lock wait frequency spike (more than 10 new waits in 5 minutes)
 - alert: MariaDBRowLockWaitSpike
-  expr: increase(mysql_global_status_innodb_row_lock_waits_total[5m]) > 10
+  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 10
   for: 0m
   labels:
     severity: warning
@@ -256,15 +256,18 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
     summary: "Row lock wait spike on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} had {{ $value | printf \"%.0f\" }} new row lock waits in the last 5 minutes. Possible batch job or hot-row contention."
 
-# Average lock wait time too high (over 5 seconds)
+# Average lock wait time too high (over 5 seconds within last 5 minutes)
+# 注意：不要用 mysql_global_status_innodb_row_lock_time_avg。該 metric 是從
+# MySQL 啟動累積的平均，一次歷史 long lock 會 pin 住數值直到 restart，造成
+# alert 永久觸發。必須自己用 increase() 算時間窗口內的平均才會即時。
 - alert: MariaDBRowLockTimeHigh
-  expr: mysql_global_status_innodb_row_lock_time_avg > 5000
+  expr: increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 5000
   for: 1m
   labels:
     severity: critical
   annotations:
-    summary: "Average row lock wait time exceeds 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
-    description: "{{ $labels.namespace }}/{{ $labels.pod }} average row lock wait is {{ $value }}ms. Transactions are being significantly delayed. Immediate investigation needed."
+    summary: "Recent avg row lock wait > 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} average row lock wait in the last 5 minutes is {{ $value }}ms. Transactions are being significantly delayed. Immediate investigation needed."
 
 # Severe contention: many threads blocked simultaneously
 - alert: MariaDBRowLockSevere

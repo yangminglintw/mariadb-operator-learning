@@ -739,40 +739,19 @@ kubectl --context=kind-mdb -n default exec mariadb-chaos-0 -c mariadb -- \
 
 **Step 4**：如果 alert 已 resolved（lock 已結束）→ 第十節事後追溯
 
-### 常用 PromQL 告警規則參考
+### 對應的 Alert
 
-```yaml
-# 當前有 row lock wait
-- alert: MariaDBRowLockWait
-  expr: mysql_global_status_innodb_row_lock_current_waits > 0
-  for: 30s
-  labels:
-    severity: info
-  annotations:
-    summary: "Row lock wait detected on {{ $labels.namespace }}/{{ $labels.pod }}"
-    runbook: "執行 check_row_locks.sh 或第三節 Query 1 找出 blocking SQL"
+Alert 的正式定義在 [`14-qps-and-lock-remediation.md`](14-qps-and-lock-remediation.md) 第二節。
+本文件定位是**診斷 runbook**，不重複定義 alert。
 
-# lock wait 次數快速增長（5 分鐘內增加 > 10 次）
-- alert: MariaDBRowLockWaitSpike
-  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 10
-  labels:
-    severity: info
-  annotations:
-    summary: "Row lock wait spike on {{ $labels.namespace }}/{{ $labels.pod }}"
+主要對應 alert：
 
-# 最近 5 分鐘的平均 lock wait 時間過高
-# 注意：不要直接用 mysql_global_status_innodb_row_lock_time_avg
-# 該 metric 是從 MySQL 啟動累積的平均，一次歷史 long lock 會 pin 住數值直到
-# MySQL restart 或有足夠多的 short lock 稀釋平均。必須自己用 increase() 算
-# 時間窗口內的平均才會即時。
-- alert: MariaDBRowLockTimeHigh
-  expr: increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 5000
-  for: 1m
-  labels:
-    severity: info
-  annotations:
-    summary: "Recent avg row lock wait > 5s on {{ $labels.namespace }}/{{ $labels.pod }}"
-```
+| Alert | 對應處理 |
+|---|---|
+| `MariaDBRowLockContention` | 第三節 Query 1：找 blocker / waiter |
+| `MariaDBRowLockSevere` | 第三節 Query 1 + 考慮 KILL（見第六節）|
+| `MariaDBRowLockTimeHigh` | 第十節事後追溯 |
+| `MariaDBRowLockWaitSpike` | 第三節 + 第五節（blocking_query 為 NULL 時的追溯）|
 
 ---
 
