@@ -204,6 +204,63 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
   annotations:
     summary: "MariaDB container CPU throttling on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} is being CPU throttled. Consider increasing CPU limits."
+
+# === Replication Health Alerts ===
+
+# IO thread down — replication fully disconnected
+- alert: MariaDBReplicationIOThreadDown
+  expr: mysql_slave_status_slave_io_running == 0 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 30s
+  labels:
+    severity: info
+    group_name: platform
+  annotations:
+    summary: "Replication IO thread down on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} IO thread stopped. Replication is fully disconnected."
+
+# SQL thread down — relay log not being applied
+- alert: MariaDBReplicationSQLThreadDown
+  expr: mysql_slave_status_slave_sql_running == 0 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 30s
+  labels:
+    severity: info
+    group_name: platform
+  annotations:
+    summary: "Replication SQL thread down on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} SQL thread stopped. Relay log is not being applied."
+
+# Replication error — SQL error, possible data inconsistency
+- alert: MariaDBReplicationError
+  expr: mysql_slave_status_last_errno != 0 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 1m
+  labels:
+    severity: info
+    group_name: platform
+  annotations:
+    summary: "Replication error on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} replication error. SQL thread may be stopped."
+
+# Replication lag anomaly — exceeds 3x 7-day P95 baseline
+- alert: MariaDBReplicationLagWarning
+  expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 3 * quantile_over_time(0.95, (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay)[7d:1m] offset 1d) + 10 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 2m
+  labels:
+    severity: info
+    group_name: all
+  annotations:
+    summary: "Replication lag anomaly on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} lag {{ $value }}s exceeds 3x its 7-day P95 baseline."
+
+# Replication lag critical — hard ceiling regardless of baseline
+- alert: MariaDBReplicationLagCritical
+  expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 300 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 1m
+  labels:
+    severity: info
+    group_name: all
+  annotations:
+    summary: "Replication lag > 5min on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} replication lag is {{ $value }}s. Data inconsistency risk."
 ```
 
 ---
@@ -218,8 +275,14 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
 | MariaDBThreadsRunningCritical | threads_running > 30 | 1m | warning | platform |
 | MariaDBSlowQueriesSpike | slow queries > 0.5/s | 2m | info | user |
 | MariaDBCPUThrottlingHigh | CPU throttle > 25% | 5m | warning | platform |
+| MariaDBReplicationIOThreadDown | IO thread 停了 = replication 斷開 | 30s | info | platform |
+| MariaDBReplicationSQLThreadDown | SQL thread 停了 = relay log 不在 apply | 30s | info | platform |
+| MariaDBReplicationError | Replication SQL error | 1m | info | platform |
+| MariaDBReplicationLagWarning | Lag 超過 7 天 P95 baseline × 3 | 2m | info | all |
+| MariaDBReplicationLagCritical | Lag > 300s（固定硬底線）| 1m | info | all |
 
 > Row lock 相關 alert 見 [`11-row-lock-diagnosis.md`](11-row-lock-diagnosis.md) 第十一節。
+> Semi-sync 相關 alert 見 [`12-semi-sync-and-error-1236.md`](12-semi-sync-and-error-1236.md)。
 
 ### QPS Alerts（Optional — App team 自行啟用）
 
