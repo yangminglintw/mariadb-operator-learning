@@ -1235,18 +1235,18 @@ spec:
     summary: "Connection usage > 95% on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} using {{ $value | printf \"%.0f\" }}% of max_connections. Imminent connection rejection."
 
-# --- Connection storm (sudden spike in new connections/sec) ---
+# --- Connection storm (baseline-relative: sudden spike in new connections/sec) ---
 # rate(connections) measures NEW connections created per second
-# Normal with connection pool: near 0 (reuses connections)
-# Storm: > 50/sec indicates pool misconfiguration, leak, or retry spiral
+# Uses 7d baseline to auto-adapt per DB (some DBs have high churn without pool)
+# + 20 buffer prevents low-baseline DBs from false-firing
 - alert: MariaDBConnectionStorm
-  expr: rate(mysql_global_status_connections[5m]) > 50
+  expr: rate(mysql_global_status_connections[5m]) > 3 * avg_over_time(rate(mysql_global_status_connections[5m])[7d:5m] offset 1d) + 20
   for: 2m
   labels:
     severity: info
   annotations:
     summary: "Connection storm on {{ $labels.namespace }}/{{ $labels.pod }}"
-    description: "{{ $labels.namespace }}/{{ $labels.pod }} creating {{ $value | printf \"%.0f\" }} new connections/sec. Possible connection pool issue or retry storm."
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} creating {{ $value | printf \"%.0f\" }} new connections/sec, exceeding 3x its 7-day baseline."
 
 # --- Post-incident: connection refused ---
 - alert: MariaDBConnectionErrorsDetected
