@@ -240,9 +240,15 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
     summary: "Replication error on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} replication error. SQL thread may be stopped."
 
-# Replication lag anomaly — exceeds 3x 7-day P95 baseline
+# Replication lag warning — unusual spike above the app's own baseline
+# This intentionally has no universal fixed threshold. Some apps regularly run
+# with higher replica lag, so fixed warning thresholds should be app-specific.
 - alert: MariaDBReplicationLagWarning
-  expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 3 * quantile_over_time(0.95, (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay)[7d:1m] offset 1d) + 10 and ON (instance) mysql_slave_status_master_server_id > 0
+  expr: |
+    (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 60
+    and
+    (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 3 * quantile_over_time(0.95, (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay)[7d:1m] offset 1d) + 10
+    and ON (instance) mysql_slave_status_master_server_id > 0
   for: 2m
   labels:
     severity: info
@@ -251,15 +257,30 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
     summary: "Replication lag anomaly on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} lag {{ $value }}s exceeds 3x its 7-day P95 baseline."
 
-# Replication lag critical — hard ceiling regardless of baseline
-- alert: MariaDBReplicationLagCritical
+# Optional app-owned SLO alert. Enable this per workload and set the threshold
+# to the maximum lag the app can tolerate, for example 300s, 900s, or 3600s.
+- alert: MariaDBReplicationLagSLOBreach
   expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 300 and ON (instance) mysql_slave_status_master_server_id > 0
-  for: 1m
+  for: 5m
   labels:
-    severity: info
+    severity: warning
+    group_name: user
+  annotations:
+    summary: "Replication lag SLO breach on {{ $labels.namespace }}/{{ $labels.pod }}"
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} replication lag is {{ $value }}s, above the app-owned SLO threshold."
+
+# Replication lag critical — optional platform hard ceiling.
+# Pick a value above known normal lag. If a workload intentionally accepts
+# longer lag, override this threshold for that workload instead of using one
+# global value for every app.
+- alert: MariaDBReplicationLagCritical
+  expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 1800 and ON (instance) mysql_slave_status_master_server_id > 0
+  for: 5m
+  labels:
+    severity: warning
     group_name: all
   annotations:
-    summary: "Replication lag > 5min on {{ $labels.namespace }}/{{ $labels.pod }}"
+    summary: "Replication lag > 30min on {{ $labels.namespace }}/{{ $labels.pod }}"
     description: "{{ $labels.namespace }}/{{ $labels.pod }} replication lag is {{ $value }}s. Data inconsistency risk."
 ```
 
@@ -278,8 +299,9 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
 | MariaDBReplicationIOThreadDown | IO thread 停了 = replication 斷開 | 30s | info | platform |
 | MariaDBReplicationSQLThreadDown | SQL thread 停了 = relay log 不在 apply | 30s | info | platform |
 | MariaDBReplicationError | Replication SQL error | 1m | info | platform |
-| MariaDBReplicationLagWarning | Lag 超過 7 天 P95 baseline × 3 | 2m | info | all |
-| MariaDBReplicationLagCritical | Lag > 300s（固定硬底線）| 1m | info | all |
+| MariaDBReplicationLagWarning | Lag > 60s 且超過 7 天 P95 baseline × 3 | 2m | info | all |
+| MariaDBReplicationLagSLOBreach | Lag 超過 app 自訂 SLO，例如 300s / 900s / 3600s | 5m | warning | user |
+| MariaDBReplicationLagCritical | Lag > 1800s（平台預設硬底線，可依 workload 調整）| 5m | warning | all |
 
 > Row lock 相關 alert 見 [`11-row-lock-diagnosis.md`](11-row-lock-diagnosis.md) 第十一節。
 > Semi-sync 相關 alert 見 [`12-semi-sync-and-error-1236.md`](12-semi-sync-and-error-1236.md)。
