@@ -932,12 +932,7 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
     description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL."
 
 - alert: MariaDBRowLockWaitSpike
-  expr: |
-    increase(mysql_global_status_innodb_row_lock_waits[5m])
-      > clamp_min(3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10, 50)
-    and
-    increase(mysql_global_status_innodb_row_lock_time[5m])
-      / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 100
+  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > clamp_min(3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10, 50) and increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 100
   for: 10m
   labels:
     severity: info
