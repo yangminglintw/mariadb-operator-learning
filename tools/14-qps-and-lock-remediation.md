@@ -244,11 +244,7 @@ Prometheus 原生無法做「跟歷史同時段比較」的 anomaly detection。
 # This intentionally has no universal fixed threshold. Some apps regularly run
 # with higher replica lag, so fixed warning thresholds should be app-specific.
 - alert: MariaDBReplicationLagWarning
-  expr: |
-    (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 60
-    and
-    (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 3 * quantile_over_time(0.95, (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay)[7d:1m] offset 1d) + 10
-    and ON (instance) mysql_slave_status_master_server_id > 0
+  expr: (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 60 and (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay) > 3 * quantile_over_time(0.95, (mysql_slave_status_seconds_behind_master - mysql_slave_status_sql_delay)[7d:1m] offset 1d) + 10 and ON (instance) mysql_slave_status_master_server_id > 0
   for: 2m
   labels:
     severity: info
