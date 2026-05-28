@@ -258,7 +258,7 @@ kubectl --context=<CTX> -n <NS> exec <POD> -c mariadb -- \
 
 | 項目 | 內容 |
 |------|------|
-| **觸發條件** | `increase(mysql_global_status_innodb_row_lock_waits[5m]) > 3 * avg_over_time(...[7d:5m] offset 1d) + 10`（最近 5 分鐘 > 7 天 baseline × 3）|
+| **觸發條件** | 最近 5 分鐘 wait 次數 > `max(7 天 baseline × 3 + 10, 50)`，且最近 5 分鐘平均等待時間 > 100ms，持續 10 分鐘 |
 | **緊急度** | 低 |
 | **group_name** | all |
 
@@ -275,7 +275,7 @@ kubectl --context=<CTX> -n <NS> exec <POD> -c mariadb -- \
 
 ### 通知 User（可選）
 
-如果頻繁發生，通知 user review transaction 設計。否則觀察即可。
+如果頻繁發生但 `RowLockContention` / `RowLockTimeHigh` 沒有一起觸發，通常代表 app 有規律的短 row lock 競爭，先當成趨勢訊號，不建議 page。通知 user review transaction 設計即可。
 
 ---
 

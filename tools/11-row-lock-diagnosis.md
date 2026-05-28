@@ -915,7 +915,7 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
 |------|------|--------|
 | 正常短暫 lock | `current_waits` 瞬間 > 0，幾秒內歸零 | 無需 alert |
 | 持續性競爭 | `current_waits` 持續 > 3 超過 2 分鐘 | warning |
-| Lock wait 暴增 | 最近 5 分鐘超過 7 天 baseline × 3 | warning |
+| Lock wait 暴增 | 最近 5 分鐘超過 7 天 baseline × 3，且平均等待 > 100ms | info |
 | 長時間等待 | 最近 5 分鐘平均等待時間 > 5 秒 | critical |
 | 大量 thread 被阻塞 | `current_waits` > 10 | critical |
 
@@ -932,13 +932,18 @@ Transaction B: UPDATE orders SET status='cancel' WHERE id=5; ← 等待 X lock�
     description: "{{ $labels.namespace }}/{{ $labels.pod }} has {{ $value }} threads waiting for row locks for over 2 minutes. Run check_row_locks.sh to identify blocking SQL."
 
 - alert: MariaDBRowLockWaitSpike
-  expr: increase(mysql_global_status_innodb_row_lock_waits[5m]) > 3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10
-  for: 5m
+  expr: |
+    increase(mysql_global_status_innodb_row_lock_waits[5m])
+      > clamp_min(3 * avg_over_time(increase(mysql_global_status_innodb_row_lock_waits[5m])[7d:5m] offset 1d) + 10, 50)
+    and
+    increase(mysql_global_status_innodb_row_lock_time[5m])
+      / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 100
+  for: 10m
   labels:
-    severity: warning
+    severity: info
   annotations:
     summary: "Row lock wait anomaly on {{ $labels.namespace }}/{{ $labels.pod }}"
-    description: "{{ $labels.namespace }}/{{ $labels.pod }} row lock waits in last 5m exceeds 3x its 7-day baseline (excl. last 24h). Current: {{ $value | printf \"%.1f\" }}."
+    description: "{{ $labels.namespace }}/{{ $labels.pod }} row lock waits in last 5m exceed baseline and minimum volume, with recent avg wait > 100ms. Current waits increase: {{ $value | printf \"%.1f\" }}."
 
 - alert: MariaDBRowLockTimeHigh
   expr: increase(mysql_global_status_innodb_row_lock_time[5m]) / clamp_min(increase(mysql_global_status_innodb_row_lock_waits[5m]), 1) > 5000
