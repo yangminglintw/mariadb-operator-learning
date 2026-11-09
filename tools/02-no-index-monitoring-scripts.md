@@ -1,6 +1,6 @@
 # No-Index Query 監控腳本
 
-## 腳本 1：用 Digest 查完整 SQL
+## 腳本 1：用 Digest 查留存的 SQL
 
 ```bash
 #!/bin/bash
@@ -47,11 +47,33 @@ get_role() {
 }
 
 echo "Digest: ${DIGEST}"
+echo "SQL_TEXT = 資料庫留存的 SQL；不保證完整。腳本不裁切 SQL，也不自行加上 ...。"
+echo "capture_status: possibly_truncated = 達到上限；below_limit = 未達上限（不保證完整）；unknown = 無法判定。"
 echo ""
 
 FOUND=0
 
 for POD in $PODS; do
+  # 每個 pod 的設定可能不同。舊版／查詢失敗時使用 NULL，不假設預設值。
+  if ! SQL_TEXT_LIMIT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
+    mariadb -u root -p"${MYSQL_PWD}" -N -B -e "
+      SELECT VARIABLE_VALUE
+      FROM information_schema.GLOBAL_VARIABLES
+      WHERE VARIABLE_NAME = 'PERFORMANCE_SCHEMA_MAX_SQL_TEXT_LENGTH'
+    "); then
+    SQL_TEXT_LIMIT=NULL
+  fi
+  case "$SQL_TEXT_LIMIT" in
+    ''|*[!0-9]*) SQL_TEXT_LIMIT=NULL ;;
+  esac
+
+  # 與 SQL_TEXT 在同一次 SELECT 計算，避免 history 淘汰造成狀態與 SQL 不一致。
+  CAPTURE_STATUS="CASE
+    WHEN SQL_TEXT IS NULL OR ${SQL_TEXT_LIMIT} IS NULL THEN 'unknown'
+    WHEN OCTET_LENGTH(SQL_TEXT) >= ${SQL_TEXT_LIMIT} THEN 'possibly_truncated'
+    ELSE 'below_limit'
+  END"
+
   if [ "$VERBOSE" = "--verbose" ]; then
     echo "----------------------------------------"
     echo "Pod: ${POD}"
@@ -64,6 +86,9 @@ for POD in $PODS; do
       mariadb -u root -p"${MYSQL_PWD}" -e "
         SELECT IFNULL(CURRENT_SCHEMA, 'N/A') AS schema_name,
                SQL_TEXT AS sql_text,
+               OCTET_LENGTH(SQL_TEXT) AS sql_text_bytes,
+               ${SQL_TEXT_LIMIT} AS sql_text_limit_bytes,
+               ${CAPTURE_STATUS} AS capture_status,
                ROWS_EXAMINED AS rows_examined,
                ROWS_SENT AS rows_sent
         FROM performance_schema.events_statements_history
@@ -82,6 +107,9 @@ for POD in $PODS; do
         mariadb -u root -p"${MYSQL_PWD}" -e "
           SELECT IFNULL(CURRENT_SCHEMA, 'N/A') AS schema_name,
                  SQL_TEXT AS sql_text,
+                 OCTET_LENGTH(SQL_TEXT) AS sql_text_bytes,
+                 ${SQL_TEXT_LIMIT} AS sql_text_limit_bytes,
+                 ${CAPTURE_STATUS} AS capture_status,
                  ROWS_EXAMINED AS rows_examined,
                  ROWS_SENT AS rows_sent
           FROM performance_schema.events_statements_history_long
@@ -102,7 +130,9 @@ for POD in $PODS; do
   else
     RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
       mariadb -u root -p"${MYSQL_PWD}" -N -e "
-        SELECT SQL_TEXT
+        SELECT CONCAT('[SQL_TEXT; bytes=', IFNULL(OCTET_LENGTH(SQL_TEXT), 'unknown'),
+                      '; limit_bytes=', IFNULL(${SQL_TEXT_LIMIT}, 'unknown'),
+                      '; capture_status=', ${CAPTURE_STATUS}, '] ', IFNULL(SQL_TEXT, '<NULL>'))
         FROM performance_schema.events_statements_history
         WHERE DIGEST = '${DIGEST}'
         LIMIT 1
@@ -112,7 +142,9 @@ for POD in $PODS; do
     if [ -z "$RESULT" ]; then
       RESULT=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
         mariadb -u root -p"${MYSQL_PWD}" -N -e "
-          SELECT SQL_TEXT
+          SELECT CONCAT('[SQL_TEXT; bytes=', IFNULL(OCTET_LENGTH(SQL_TEXT), 'unknown'),
+                      '; limit_bytes=', IFNULL(${SQL_TEXT_LIMIT}, 'unknown'),
+                      '; capture_status=', ${CAPTURE_STATUS}, '] ', IFNULL(SQL_TEXT, '<NULL>'))
           FROM performance_schema.events_statements_history_long
           WHERE DIGEST = '${DIGEST}'
           LIMIT 1
@@ -129,7 +161,9 @@ done
 
 if [ "$FOUND" -eq 0 ] || [ "$VERBOSE" = "--verbose" ]; then
   echo ""
-  echo "=== Digest Pattern (from summary) ==="
+  echo "=== DIGEST_TEXT：正規化模板（from summary） ==="
+  echo "? 是參數佔位；... 可能是清單正規化或長度限制，不能只靠點點判斷截斷。"
+  echo "模板不能還原原始參數或已截斷內容。"
   for POD in $PODS; do
     ROLE=$(get_role "$POD")
     SUMMARY=$(kubectl --context="${CONTEXT}" -n "${NAMESPACE}" exec "${POD}" -c mariadb -- \
@@ -157,29 +191,23 @@ if [ "$FOUND" -eq 0 ] || [ "$VERBOSE" = "--verbose" ]; then
 fi
 ```
 
+### 判讀長 SQL
+
+- `SQL_TEXT` 是 history／history_long 留存的內容；腳本原樣輸出，不保證資料庫收錄時未截斷。
+- `sql_text_bytes`／`bytes` 是資料庫內 `SQL_TEXT` 的位元組數（不是終端輸出字元數）；`sql_text_limit_bytes`／`limit_bytes` 是該 pod 的 `performance_schema_max_sql_text_length`。
+- `possibly_truncated` 表示長度達到上限，可能已截斷；剛好等於上限的完整 SQL 也會提示。
+- `below_limit` 只表示未達目前上限，不是完整性保證；`unknown` 表示 SQL 為 NULL 或設定無法取得。腳本不猜預設值，也不修改資料庫設定。
+- `DIGEST_TEXT` 是正規化模板。`?` 與 `...` 不足以證明原始 SQL 是否完整；`--verbose` 也無法補回資料庫未保留的內容。
+
 ### 輸出範例
 
 **精簡版（預設）**：
 ```
 Digest: abc123def456...
 
-[mariadb-0] (Primary) SELECT * FROM users WHERE email = 'test@example.com'
-[mariadb-2] (Replica) SELECT * FROM users WHERE email = 'foo@bar.com'
+[mariadb-0] (Primary) [SQL_TEXT; bytes=52; limit_bytes=1024; capture_status=below_limit] SELECT * FROM users WHERE email = 'test@example.com'
+[mariadb-2] (Replica) [SQL_TEXT; bytes=47; limit_bytes=1024; capture_status=below_limit] SELECT * FROM users WHERE email = 'foo@bar.com'
 
-=== Digest Pattern (from summary) ===
-[mariadb-0] (Primary)
-*************************** 1. row ***************************
-   schema_name: myapp
-       pattern: SELECT * FROM `users` WHERE `email` = ?
-no_index_count: 5000
-    total_exec: 5000
-
-[mariadb-1] (Replica)
-*************************** 1. row ***************************
-   schema_name: myapp
-       pattern: SELECT * FROM `users` WHERE `email` = ?
-no_index_count: 50000
-    total_exec: 50000
 ```
 
 **完整版（--verbose）**：
@@ -193,6 +221,9 @@ Role: Primary
 *************************** 1. row ***************************
   schema_name: myapp
      sql_text: SELECT * FROM users WHERE email = 'test@test.com'
+sql_text_bytes: 49
+sql_text_limit_bytes: 1024
+capture_status: below_limit
 rows_examined: 50000
     rows_sent: 1
 
@@ -203,6 +234,9 @@ Role: Replica
 *************************** 1. row ***************************
   schema_name: myapp
      sql_text: SELECT * FROM users WHERE email = 'another@test.com'
+sql_text_bytes: 52
+sql_text_limit_bytes: 1024
+capture_status: below_limit
 rows_examined: 50000
     rows_sent: 1
 
@@ -211,7 +245,7 @@ Pod: mariadb-2
 Role: Replica
 [Not found in history]
 
-=== Digest Pattern (from summary) ===
+=== DIGEST_TEXT：正規化模板（from summary） ===
 [mariadb-0] (Primary)
 *************************** 1. row ***************************
    schema_name: myapp
@@ -590,7 +624,7 @@ Step 1: 從 Grafana 拿到 digest
         │
         ▼
 Step 2: ./get_sql_by_digest.sh prod mariadb mariadb <digest>
-        └── 得到完整 SQL
+        └── 得到留存 SQL 與可能截斷狀態
         │
         ▼
 Step 3: ./analyze_sql.sh prod mariadb mariadb "<SQL>"
@@ -609,7 +643,7 @@ Step 3: ./analyze_sql.sh prod mariadb mariadb "<SQL>"
 
 ```yaml
 name: Get SQL by Digest
-description: 用 digest 查詢完整 SQL（查所有 pods）
+description: 用 digest 查詢留存 SQL 與可能截斷狀態（查所有 pods）
 options:
   - name: CONTEXT
     description: Kubernetes context
